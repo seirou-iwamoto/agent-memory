@@ -1,5 +1,7 @@
 # agent-memory
 
+[![ci](https://github.com/seirou-iwamoto/agent-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/seirou-iwamoto/agent-memory/actions/workflows/ci.yml)
+
 Read Claude Code's project memory from the command line, so that any agent —
 Claude Code, Codex, or your own tooling — searches the same corpus instead of
 keeping a private copy of it.
