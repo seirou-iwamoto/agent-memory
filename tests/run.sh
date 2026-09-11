@@ -484,7 +484,7 @@ expect_status 'a malformed pattern is refused' "$EX_USAGE"
 expect_stderr_has 'the malformed-pattern refusal names the engine' 'not a valid'
 
 AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}' run_am resolve -C "$alpha_root"
-expect_status 'resolve ignores the redaction pattern entirely' "$EX_OK"
+expect_status 'resolve never reads the redaction pattern' "$EX_OK"
 
 # ---------------------------------------------------------------- regression cases
 #
@@ -539,16 +539,28 @@ cd "$repo_root" || exit 1
 expect_status 'a directory named like a cd option still resolves' "$EX_OK"
 expect_jq 'the option-like directory resolves to its own memory' '.dir' "$dashp_memory"
 
-section 'regression: filename pattern is validated for every engine that sees it'
+section 'regression: one engine decides whether a filename is sensitive'
 
-# Valid for rg and jq, invalid for bash ERE. It used to pass startup validation and
-# then fail at match time, where the failure was indistinguishable from "no match"
-# and let a sensitive filename through.
+# The filename screen used to be evaluated by bash [[ =~ ]] and by jq as well as rg.
+# Three engines agreeing on syntax does not make them agree on meaning, and whenever
+# they disagreed a name meant to be hidden was emitted. rg is now the only judge, so
+# both of these patterns have to behave exactly as rg reads them.
+
+# rg accepts this; bash ERE does not. It must screen the file, not be rejected.
 AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN='(?:credential)' \
-  run_am search -C "$alpha_root" -- 'credential'
-expect_status 'a PCRE-only filename pattern is refused at startup' "$EX_USAGE"
-expect_stderr_has 'the refusal names the bash dialect' 'POSIX ERE'
-expect_stdout_lacks 'no sensitive filename escapes through a broken pattern' 'credentials.md'
+  run_am search -C "$alpha_root" -- 'only_inside_credentials_file'
+expect_status 'an rg-valid group syntax screens the file' "$EX_NOMATCH"
+
+# \w means "word character" to rg but nothing to bash 3.2's POSIX ERE, where the
+# pattern silently failed to match and let every filename through.
+AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN='\w+' \
+  run_am search -C "$alpha_root" -- 'the quick brown fox'
+expect_status 'a pattern matching every name screens every file' "$EX_NOMATCH"
+
+AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN='\w+' \
+  run_am search -C "$alpha_root" -- 'project_alpha'
+expect_status 'not even a filename hit survives that pattern' "$EX_NOMATCH"
+expect_stdout_lacks 'no path leaks through the filename screen' 'project_alpha.md'
 
 section 'regression: symlinks are refused at every component'
 
@@ -561,7 +573,7 @@ ln -s "$symlink_component_config/projects/real" "$symlink_component_config/proje
 
 CLAUDE_CONFIG_DIR="$symlink_component_config" run_am resolve -C "$symlink_component_root"
 expect_status 'a symlinked project component is refused' "$EX_DATAERR"
-expect_stderr_has 'the refusal names the component' 'symlinked path component'
+expect_stderr_has 'the refusal names the component' 'symlinked project directory'
 
 dangling_config="$tmp_root/claude-dangling"
 mkdir -p "$dangling_config/projects/ok/memory" "$dangling_config/projects/broken"
@@ -571,6 +583,26 @@ ln -s "$tmp_root/does-not-exist-at-all" "$dangling_config/projects/broken/memory
 CLAUDE_CONFIG_DIR="$dangling_config" run_am search --all-projects -- 'healthy_entry'
 expect_status 'a dangling memory symlink stops the whole sweep' "$EX_DATAERR"
 expect_stdout_lacks 'the sweep returns no partial result' 'healthy_entry'
+
+# A project symlink that cannot be followed all the way to memory never appears in a
+# */memory glob, so checking only the glob results let the sweep return a partial
+# answer with exit 0. Project entries are enumerated and checked on their own now.
+broken_project_config="$tmp_root/claude-broken-project"
+mkdir -p "$broken_project_config/projects/ok/memory" "$broken_project_config/target-without-memory"
+printf '%s\n' '- healthy_entry' > "$broken_project_config/projects/ok/memory/n.md"
+ln -s "$tmp_root/no-such-target-at-all" "$broken_project_config/projects/dangling-project"
+
+CLAUDE_CONFIG_DIR="$broken_project_config" run_am search --all-projects -- 'healthy_entry'
+expect_status 'a dangling project symlink stops the whole sweep' "$EX_DATAERR"
+expect_stderr_has 'the refusal names the project directory' 'symlinked project directory'
+expect_stdout_lacks 'no partial result survives a dangling project symlink' 'healthy_entry'
+
+rm "$broken_project_config/projects/dangling-project"
+ln -s "$broken_project_config/target-without-memory" "$broken_project_config/projects/memoryless-project"
+
+CLAUDE_CONFIG_DIR="$broken_project_config" run_am search --all-projects -- 'healthy_entry'
+expect_status 'a project symlink whose target lacks memory stops the sweep too' "$EX_DATAERR"
+expect_stdout_lacks 'no partial result survives a memory-less project symlink' 'healthy_entry'
 
 section 'regression: --all-sources reaches Codex without Claude'
 
