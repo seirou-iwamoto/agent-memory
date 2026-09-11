@@ -42,6 +42,11 @@ trap cleanup EXIT
 export CLAUDE_CONFIG_DIR="$tmp_root/claude"
 export CODEX_HOME="$tmp_root/codex"
 unset CLAUDE_CODE_PROJECT_DIR_NAME
+# The redaction overrides are part of the tool's public surface, so a developer may
+# well have them exported. Leaving them set silently reshapes the secret-handling
+# expectations below; the suite must supply its own values, never inherit them.
+unset AGENT_MEMORY_SENSITIVE_PATTERN
+unset AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN
 mkdir -p "$CLAUDE_CONFIG_DIR/projects"
 
 stderr_file="$tmp_root/.stderr"
@@ -95,6 +100,13 @@ expect_stderr_has() {
   case "$am_stderr" in
     *"$2"*) pass "$1" ;;
     *) failx "$1" "stderr lacked '$2'; got: $am_stderr" ;;
+  esac
+}
+
+expect_stderr_lacks() {
+  case "$am_stderr" in
+    *"$2"*) failx "$1" "stderr unexpectedly contained '$2'" ;;
+    *) pass "$1" ;;
   esac
 }
 
@@ -342,6 +354,10 @@ run_am search -C "$alpha_root" -- 'inside_uppercase_sensitive_file'
 expect_status 'a sensitive filename is caught regardless of case' "$EX_NOMATCH"
 
 run_am search -C "$alpha_root" -- 'the quick brown fox'
+# Assert the search actually succeeded first: a wholesale failure also produces
+# stdout without that filename in it, which would pass the check below for free.
+expect_status 'the symlink-skip case really searched' "$EX_OK"
+expect_stdout_has 'the symlink-skip case found the real file' 'project_alpha.md'
 expect_stdout_lacks 'symlinked memory files are skipped' 'symlinked_note.md'
 
 # ---------------------------------------------------------------- path hardening
@@ -395,8 +411,12 @@ case "$collide_stderr" in
   *) failx 'the collision refusal explains itself' "stderr: $collide_stderr" ;;
 esac
 case "$collide_stderr" in
-  *"$tmp_root/collide/inner"*) pass 'the collision refusal names both paths' ;;
-  *) failx 'the collision refusal names both paths' "stderr: $collide_stderr" ;;
+  *"$tmp_root/collide/inner"*) pass 'the collision refusal names the physical path' ;;
+  *) failx 'the collision refusal names the physical path' "stderr: $collide_stderr" ;;
+esac
+case "$collide_stderr" in
+  *"$tmp_root/collide-inner"*) pass 'the collision refusal names the logical path too' ;;
+  *) failx 'the collision refusal names the logical path too' "stderr: $collide_stderr" ;;
 esac
 
 # ---------------------------------------------------------------- env fallback
@@ -466,14 +486,157 @@ expect_stderr_has 'the malformed-pattern refusal names the engine' 'not a valid'
 AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}' run_am resolve -C "$alpha_root"
 expect_status 'resolve ignores the redaction pattern entirely' "$EX_OK"
 
+# ---------------------------------------------------------------- regression cases
+#
+# Everything below pins a defect found in review on 2026-09-12. Each case failed
+# before the corresponding fix and states the behaviour that must not come back.
+
+section 'regression: --limit is parsed as decimal'
+
+run_am search -C "$alpha_root" --limit 010 -- 'a'
+expect_status 'a leading-zero limit is refused rather than read as octal' "$EX_USAGE"
+
+run_am search -C "$alpha_root" --limit 08 -- 'a'
+expect_status 'a leading-zero limit outside octal is refused too' "$EX_USAGE"
+expect_stderr_lacks 'no arithmetic error leaks out of the limit check' 'value too great'
+
+run_am search -C "$alpha_root" --limit 18446744073709551616 -- 'a'
+expect_status 'a limit past the integer range is refused' "$EX_USAGE"
+expect_stderr_lacks 'no integer-expression error leaks out' 'integer expression expected'
+
+run_am search -C "$alpha_root" --limit 200 -- 'a'
+expect_status 'the documented maximum is still accepted' "$EX_OK"
+
+section 'regression: every control character is refused'
+
+run_am search -C "$alpha_root" -- "$(printf 'a\033b')"
+expect_status 'an ESC in the query is refused' "$EX_DATAERR"
+
+run_am search -C "$alpha_root" -- "$(printf 'a\177b')"
+expect_status 'a DEL in the query is refused' "$EX_DATAERR"
+
+run_am resolve -C "$(printf '%s/missing\033[31m' "$tmp_root")"
+expect_status 'an ESC in a path is refused' "$EX_DATAERR"
+case "$am_stderr" in
+  *$'\033'*) failx 'no raw escape sequence reaches stderr' 'stderr carried a raw ESC' ;;
+  *) pass 'no raw escape sequence reaches stderr' ;;
+esac
+
+section 'regression: cd is hardened'
+
+mkdir -p "$tmp_root/cdpath-trap/alpha"
+cd "$tmp_root" || exit 1
+CDPATH="$tmp_root/cdpath-trap" run_am resolve -C alpha
+cd "$repo_root" || exit 1
+expect_status 'a relative -C ignores CDPATH' "$EX_OK"
+expect_jq 'a relative -C resolves against the working directory' '.dir' "$alpha_memory"
+
+dashp_memory=$(new_project "$tmp_root/-P")
+printf '%s\n' '- inside_option_like_directory' > "$dashp_memory/note.md"
+cd "$tmp_root" || exit 1
+run_am resolve -C -P
+cd "$repo_root" || exit 1
+expect_status 'a directory named like a cd option still resolves' "$EX_OK"
+expect_jq 'the option-like directory resolves to its own memory' '.dir' "$dashp_memory"
+
+section 'regression: filename pattern is validated for every engine that sees it'
+
+# Valid for rg and jq, invalid for bash ERE. It used to pass startup validation and
+# then fail at match time, where the failure was indistinguishable from "no match"
+# and let a sensitive filename through.
+AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN='(?:credential)' \
+  run_am search -C "$alpha_root" -- 'credential'
+expect_status 'a PCRE-only filename pattern is refused at startup' "$EX_USAGE"
+expect_stderr_has 'the refusal names the bash dialect' 'POSIX ERE'
+expect_stdout_lacks 'no sensitive filename escapes through a broken pattern' 'credentials.md'
+
+section 'regression: symlinks are refused at every component'
+
+symlink_component_config="$tmp_root/claude-symlink-component"
+symlink_component_root="$tmp_root/symlink-component"
+mkdir -p "$symlink_component_root" "$symlink_component_config/projects/real/memory"
+printf '%s\n' '- reached_through_symlinked_project' > "$symlink_component_config/projects/real/memory/n.md"
+component_slug=$(slug_of "$(cd "$symlink_component_root" && pwd -P)")
+ln -s "$symlink_component_config/projects/real" "$symlink_component_config/projects/$component_slug"
+
+CLAUDE_CONFIG_DIR="$symlink_component_config" run_am resolve -C "$symlink_component_root"
+expect_status 'a symlinked project component is refused' "$EX_DATAERR"
+expect_stderr_has 'the refusal names the component' 'symlinked path component'
+
+dangling_config="$tmp_root/claude-dangling"
+mkdir -p "$dangling_config/projects/ok/memory" "$dangling_config/projects/broken"
+printf '%s\n' '- healthy_entry' > "$dangling_config/projects/ok/memory/n.md"
+ln -s "$tmp_root/does-not-exist-at-all" "$dangling_config/projects/broken/memory"
+
+CLAUDE_CONFIG_DIR="$dangling_config" run_am search --all-projects -- 'healthy_entry'
+expect_status 'a dangling memory symlink stops the whole sweep' "$EX_DATAERR"
+expect_stdout_lacks 'the sweep returns no partial result' 'healthy_entry'
+
+section 'regression: --all-sources reaches Codex without Claude'
+
+codex_only_claude="$tmp_root/claude-empty"
+codex_only_home="$tmp_root/codex-only"
+mkdir -p "$codex_only_claude/projects" "$codex_only_home/memories" "$tmp_root/codex-only-cwd"
+printf '%s\n' '- codex_only_marker' > "$codex_only_home/memories/MEMORY.md"
+
+CLAUDE_CONFIG_DIR="$codex_only_claude" CODEX_HOME="$codex_only_home" \
+  run_am search --all-sources -C "$tmp_root/codex-only-cwd" -- 'codex_only_marker'
+expect_status 'combining -C with --all-sources is still refused' "$EX_USAGE"
+
+cd "$tmp_root/codex-only-cwd" || exit 1
+CLAUDE_CONFIG_DIR="$codex_only_claude" CODEX_HOME="$codex_only_home" \
+  run_am search --all-sources -- 'codex_only_marker'
+cd "$repo_root" || exit 1
+expect_status 'Codex is searched even with zero Claude projects' "$EX_OK"
+expect_jq 'the Codex-only hit is labelled as codex' '.source' 'codex'
+
+empty_both_claude="$tmp_root/claude-none"
+empty_both_home="$tmp_root/codex-none"
+mkdir -p "$empty_both_claude/projects" "$empty_both_home" "$tmp_root/empty-both-cwd"
+cd "$tmp_root/empty-both-cwd" || exit 1
+CLAUDE_CONFIG_DIR="$empty_both_claude" CODEX_HOME="$empty_both_home" \
+  run_am search --all-sources -- 'anything'
+cd "$repo_root" || exit 1
+expect_status 'no sources at all is still EX_NOINPUT' "$EX_NOINPUT"
+
+section 'regression: a worktree reaches its parent repository'
+
+# git-common-root is the only candidate that covers this, and it needs a real
+# worktree to exercise -- the suite had no coverage for it before.
+wt_parent="$tmp_root/wtparent"
+mkdir -p "$wt_parent"
+git -C "$wt_parent" init -q
+git -C "$wt_parent" -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m init
+wt_parent_memory=$(new_project "$wt_parent")
+printf '%s\n' '- parent_repo_marker' > "$wt_parent_memory/project_parent.md"
+git -C "$wt_parent" worktree add -q "$tmp_root/wtchild" -b regression-probe
+
+run_am resolve -C "$tmp_root/wtchild"
+expect_status 'a worktree resolves' "$EX_OK"
+expect_jq 'a worktree reaches the parent repository memory' '.dir' "$wt_parent_memory"
+expect_jq 'the worktree candidate is labelled git-common-root' '.relation' 'git-common-root'
+
+run_am search -C "$tmp_root/wtchild" -- 'parent_repo_marker'
+expect_status 'a worktree searches the parent repository memory' "$EX_OK"
+
 # ---------------------------------------------------------------- read-only guarantee
 
 section 'read-only guarantee'
 
-fixture_digest_before=$(find "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" -type f -exec shasum {} \; | sort | shasum)
+# Hash file contents AND the directory listing with each entry's type, so a created,
+# deleted, or retyped entry is caught too -- a content-only digest misses all three.
+fixture_snapshot() {
+  find "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" -type f -exec shasum {} \; | sort
+  find "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" -type d -print | sed 's|^|d |' | sort
+  find "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" -type l -print | sed 's|^|l |' | sort
+  find "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" -type f -print | sed 's|^|f |' | sort
+}
+fixture_digest_before=$(fixture_snapshot | shasum)
 run_am search --all-sources -- 'fox'
+expect_status 'the read-only probe search really ran' "$EX_OK"
 run_am resolve -C "$alpha_root"
-fixture_digest_after=$(find "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" -type f -exec shasum {} \; | sort | shasum)
+expect_status 'the read-only probe resolve really ran' "$EX_OK"
+fixture_digest_after=$(fixture_snapshot | shasum)
 
 if [ "$fixture_digest_before" = "$fixture_digest_after" ]; then
   pass 'searching never mutates the memory corpus'
