@@ -164,6 +164,12 @@ FIXTURE_EOF
 
 ln -s "$alpha_memory/project_alpha.md" "$alpha_memory/symlinked_note.md"
 
+# Filename screening used to be a regex plus a hardcoded case statement. The two
+# were folded into one regex; these two fixtures cover what only the case
+# statement caught before -- a substring match and an uppercase name.
+printf '%s\n' '- inside_substring_credential_file' > "$alpha_memory/mycredentialsdump.md"
+printf '%s\n' '- inside_uppercase_sensitive_file' > "$alpha_memory/PRIVATE_KEY_NOTES.md"
+
 beta_root="$tmp_root/beta"
 beta_memory=$(new_project "$beta_root")
 printf '# Beta\n\n- beta_only_marker\n' > "$beta_memory/project_beta.md"
@@ -329,6 +335,12 @@ expect_stdout_has 'a money-bearing line is redacted' 'REDACTED: potential secret
 run_am search -C "$alpha_root" -- 'only_inside_credentials_file'
 expect_status 'a credentials-named file is excluded from search' "$EX_NOMATCH"
 
+run_am search -C "$alpha_root" -- 'inside_substring_credential_file'
+expect_status 'a sensitive filename is caught without word boundaries' "$EX_NOMATCH"
+
+run_am search -C "$alpha_root" -- 'inside_uppercase_sensitive_file'
+expect_status 'a sensitive filename is caught regardless of case' "$EX_NOMATCH"
+
 run_am search -C "$alpha_root" -- 'the quick brown fox'
 expect_stdout_lacks 'symlinked memory files are skipped' 'symlinked_note.md'
 
@@ -354,8 +366,11 @@ CLAUDE_CONFIG_DIR="$symlink_config" run_am resolve -C "$symlink_root"
 expect_status 'a symlinked memory dir is refused' "$EX_DATAERR"
 expect_stderr_has 'the symlink refusal explains itself' 'symlinked memory directory'
 
+expect_stderr_has 'the symlink refusal names the offending path' "$symlink_memory"
+
 CLAUDE_CONFIG_DIR="$symlink_config" run_am search --all-projects -- 'anything'
 expect_status 'one symlinked memory dir fails the whole --all-projects sweep' "$EX_DATAERR"
+expect_stderr_has 'the sweep failure names the offending path' "$symlink_memory"
 
 # A logical path and its physical target that collapse to the same project key
 # must be refused rather than silently resolved to one of them.
@@ -378,6 +393,10 @@ fi
 case "$collide_stderr" in
   *collision*) pass 'the collision refusal explains itself' ;;
   *) failx 'the collision refusal explains itself' "stderr: $collide_stderr" ;;
+esac
+case "$collide_stderr" in
+  *"$tmp_root/collide/inner"*) pass 'the collision refusal names both paths' ;;
+  *) failx 'the collision refusal names both paths' "stderr: $collide_stderr" ;;
 esac
 
 # ---------------------------------------------------------------- env fallback
@@ -419,6 +438,33 @@ expect_status 'the codex feed reads only its two known files' "$EX_NOMATCH"
 
 run_am search --all-projects -- 'codex_feed_marker'
 expect_status '--all-projects excludes the codex feed' "$EX_NOMATCH"
+
+# ---------------------------------------------------------------- configurable redaction
+
+section 'configurable redaction'
+
+AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}' run_am search -C "$alpha_root" -- '300'
+expect_status 'a narrowed pattern still searches' "$EX_OK"
+expect_stdout_has 'a narrowed pattern lets the money line through' '300'
+expect_stdout_lacks 'a narrowed pattern stops redacting' 'REDACTED'
+
+AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN='matches-no-real-filename' \
+  run_am search -C "$alpha_root" -- 'only_inside_credentials_file'
+expect_status 'a narrowed filename pattern exposes the skipped file' "$EX_OK"
+
+AGENT_MEMORY_SENSITIVE_PATTERN='' run_am search -C "$alpha_root" -- 'fox'
+expect_status 'an empty pattern is refused' "$EX_USAGE"
+expect_stderr_has 'the empty-pattern refusal explains itself' 'must not be empty'
+
+AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN='' run_am search -C "$alpha_root" -- 'fox'
+expect_status 'an empty filename pattern is refused' "$EX_USAGE"
+
+AGENT_MEMORY_SENSITIVE_PATTERN='[unclosed' run_am search -C "$alpha_root" -- 'fox'
+expect_status 'a malformed pattern is refused' "$EX_USAGE"
+expect_stderr_has 'the malformed-pattern refusal names the engine' 'not a valid'
+
+AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}' run_am resolve -C "$alpha_root"
+expect_status 'resolve ignores the redaction pattern entirely' "$EX_OK"
 
 # ---------------------------------------------------------------- read-only guarantee
 

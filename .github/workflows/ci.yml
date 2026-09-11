@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # macOS carries the real constraint: /bin/bash there is 3.2, which is what
+    # this script targets. Linux runs bash 5, so the pair covers both ends.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep shellcheck jq
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ripgrep shellcheck jq
+
+      - name: Report the interpreter and dependencies under test
+        run: |
+          /bin/bash --version | head -1
+          for dependency in git rg jq; do
+            printf '%s: %s\n' "$dependency" "$(command -v "$dependency")"
+          done
+
+      - name: shellcheck
+        run: shellcheck -s bash bin/agent-memory tests/run.sh
+
+      - name: tests
+        run: ./tests/run.sh

@@ -109,11 +109,23 @@ a redacted match are still printed, and anyone who can run this command can also
 logs and scrollback — places where text tends to be copied onward — not to
 protect the files from their owner.
 
-The pattern is deliberately broad. It treats email addresses and currency
-amounts as sensitive, which means a search for `invoice` may come back as a
-column of redactions. That is the intended trade-off for the author's use; if it
-is wrong for yours, edit `AGENT_MEMORY_SENSITIVE_PATTERN` near the top of the
-script.
+The default pattern is deliberately broad. It treats email addresses and
+currency amounts as sensitive, which means a search for `invoice` may come back
+as a column of redactions. That is the intended trade-off for the author's use;
+if it is wrong for yours, override it from the environment:
+
+```sh
+# Narrow redaction down to credential shapes only.
+export AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}'
+```
+
+`AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN` overrides the filename screen the same
+way. Both are validated at startup: an empty value is refused (it would redact
+every line rather than none), and so is anything the engines cannot parse.
+
+Each pattern is read by **both** `rg` (Rust regex) and `jq` (Oniguruma), so an
+override has to be valid in both dialects. The startup check tests it against
+each engine and names the one that rejected it.
 
 ## Fail-closed behaviour
 
@@ -145,9 +157,13 @@ run when diagnosing it.
 ./tests/run.sh
 ```
 
-76 cases in plain bash, no test framework. Every case runs against a fixture
+91 cases in plain bash, no test framework. Every case runs against a fixture
 under `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, so the suite never reads or writes real
 memory.
+
+CI runs the suite and `shellcheck` on both Linux and macOS. The macOS leg is the
+one that matters: `/bin/bash` there is 3.2, which is the interpreter this script
+actually targets.
 
 ## License
 
