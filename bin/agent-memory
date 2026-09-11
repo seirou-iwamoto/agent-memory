@@ -20,8 +20,12 @@ AGENT_MEMORY_CLAUDE_HOME=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
 AGENT_MEMORY_PROJECTS_DIR="$AGENT_MEMORY_CLAUDE_HOME/projects"
 AGENT_MEMORY_CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 AGENT_MEMORY_CODEX_DIR="$AGENT_MEMORY_CODEX_HOME/memories"
-AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer[[:space:]]+[^[:space:]]{12,}|(?:api[_-]?key|token|secret|password|authorization|client[_-]?secret|private[_-]?key|cookie|credential)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|(?:[$¥￥][[:space:]]*[0-9][0-9,]*(?:[.][0-9]+)?|[0-9][0-9,]*(?:[.][0-9]+)?[[:space:]]*(?:円|万円|億円|JPY|USD|EUR))'
-AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN='AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|(^|[._-])(credential|client[._-]?secret|private[._-]?key|cookie[._-]?(jar|dump))([._-]|$)'
+# 秘密らしさの判定パターン。既定は岩元の運用に合わせて広く、メールアドレスと
+# 金額まで秘密扱いする。環境変数で上書きできる (空文字は誤って全行 redact する
+# ため拒否する)。rg (Rust regex) と jq (Oniguruma) の両方で解釈されるので、
+# 上書きするなら両方で有効な構文に限る。起動時に validate_sensitive_patterns が検証する。
+AGENT_MEMORY_SENSITIVE_PATTERN=${AGENT_MEMORY_SENSITIVE_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer[[:space:]]+[^[:space:]]{12,}|(?:api[_-]?key|token|secret|password|authorization|client[_-]?secret|private[_-]?key|cookie|credential)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|(?:[$¥￥][[:space:]]*[0-9][0-9,]*(?:[.][0-9]+)?|[0-9][0-9,]*(?:[.][0-9]+)?[[:space:]]*(?:円|万円|億円|JPY|USD|EUR))'}
+AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN=${AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|credential|client[._-]?secret|private[._-]?key|cookie[._-]?(jar|dump)'}
 
 candidate_paths=()
 candidate_relations=()
@@ -64,6 +68,24 @@ die() {
 require_commands() {
   for required_command in git rg jq; do
     command -v "$required_command" >/dev/null 2>&1 || die "$EX_UNAVAILABLE" "required command not found: $required_command"
+  done
+}
+
+# 上書きされたパターンが壊れていると、rg 側は EX_IOERR、jq 側は無言の取りこぼしに
+# なる。redact は最後の防波堤なので、使う前に両エンジンで解釈できることを確かめる。
+validate_sensitive_patterns() {
+  for pattern_name in AGENT_MEMORY_SENSITIVE_PATTERN AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN; do
+    pattern_value=${!pattern_name}
+    [ -n "$pattern_value" ] ||
+      die "$EX_USAGE" "$pattern_name must not be empty; an empty pattern would redact every line"
+
+    printf '' | LC_ALL=C rg -qi -- "$pattern_value" >/dev/null 2>&1
+    pattern_rg_status=$?
+    [ "$pattern_rg_status" -le 1 ] ||
+      die "$EX_USAGE" "$pattern_name is not a valid ripgrep pattern"
+
+    jq -n --arg pattern "$pattern_value" '"" | test($pattern)' >/dev/null 2>&1 ||
+      die "$EX_USAGE" "$pattern_name is not a valid jq (Oniguruma) pattern"
   done
 }
 
@@ -129,7 +151,7 @@ record_slug() {
   slug_index=0
   while [ "$slug_index" -lt "${#seen_slugs[@]}" ]; do
     if [ "${seen_slugs[$slug_index]}" = "$slug_value" ]; then
-      [ "${seen_slug_paths[$slug_index]}" = "$slug_path" ] || die "$EX_DATAERR" "project-key collision; refusing ambiguous memory resolution"
+      [ "${seen_slug_paths[$slug_index]}" = "$slug_path" ] || die "$EX_DATAERR" "project-key collision on '$slug_value'; '${seen_slug_paths[$slug_index]}' and '$slug_path' both map to it; refusing ambiguous memory resolution"
       return 0
     fi
     slug_index=$((slug_index + 1))
@@ -161,20 +183,20 @@ add_source() {
   source_path=$2
   [ -d "$source_path" ] || return 0
   reject_control_chars "$source_path"
-  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked memory directory is not accepted"
+  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked memory directory is not accepted: $source_path"
 
   physical_source=$(physical_dir "$source_path") || exit $?
   physical_projects_root=$(physical_dir "$AGENT_MEMORY_PROJECTS_DIR") || exit $?
   relative_source=${physical_source#"$physical_projects_root"/}
-  [ "$relative_source" != "$physical_source" ] || die "$EX_DATAERR" "memory directory escapes Claude projects root"
+  [ "$relative_source" != "$physical_source" ] || die "$EX_DATAERR" "memory directory escapes Claude projects root: $physical_source"
   case "$relative_source" in
     */memory)
       project_component=${relative_source%/memory}
       case "$project_component" in
-        ''|*/*) die "$EX_DATAERR" "memory directory is not a direct project child" ;;
+        ''|*/*) die "$EX_DATAERR" "memory directory is not a direct project child: $physical_source" ;;
       esac
       ;;
-    *) die "$EX_DATAERR" "unexpected Claude memory directory layout" ;;
+    *) die "$EX_DATAERR" "unexpected Claude memory directory layout: $physical_source" ;;
   esac
 
   record_source claude "$source_relation" "$physical_source"
@@ -185,13 +207,13 @@ add_codex_source() {
   source_path=$2
   [ -d "$source_path" ] || return 0
   reject_control_chars "$source_path"
-  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked Codex memory directory is not accepted"
+  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked Codex memory directory is not accepted: $source_path"
 
   physical_source=$(physical_dir "$source_path") || exit $?
   physical_codex_root=$(physical_dir "$AGENT_MEMORY_CODEX_DIR") || exit $?
   if [ "$physical_source" != "$physical_codex_root" ]; then
     relative_source=${physical_source#"$physical_codex_root"/}
-    [ "$relative_source" != "$physical_source" ] || die "$EX_DATAERR" "Codex source escapes memory root"
+    [ "$relative_source" != "$physical_source" ] || die "$EX_DATAERR" "Codex source escapes memory root: $physical_source"
   fi
 
   record_source codex "$source_relation" "$physical_source"
@@ -257,17 +279,14 @@ value_looks_sensitive() {
 
 filename_looks_sensitive() {
   inspected_filename=$1
-  [[ "$inspected_filename" =~ $AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN ]] && return 0
-
+  # 大小を無視して 1 本の正規表現で判定する。以前はここに credential 等の
+  # case 文が併存していたが、境界なしの正規表現と実効挙動が同じで、
+  # 環境変数で上書きしても case 文側が残る不整合があったため畳んだ。
   shopt -s nocasematch
-  case "$inspected_filename" in
-    *credential*|*client_secret*|*client-secret*|*private_key*|*private-key*|*cookie_jar*|*cookie-jar*|*cookie_dump*|*cookie-dump*)
-      shopt -u nocasematch
-      return 0
-      ;;
-  esac
+  [[ "$inspected_filename" =~ $AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN ]]
+  filename_match_status=$?
   shopt -u nocasematch
-  return 1
+  return "$filename_match_status"
 }
 
 filename_matches_literal() {
@@ -312,6 +331,7 @@ search_sources() {
 
   reject_control_chars "$literal_query"
   [ -n "$literal_query" ] || die "$EX_USAGE" "query must not be empty"
+  validate_sensitive_patterns
   value_looks_sensitive "$literal_query" && die "$EX_DATAERR" "query resembles a secret; refusing search"
 
   result_cap=$((result_limit + 1))
