@@ -28,11 +28,18 @@ maintains stays the single source of truth; this tool is only a reader.
 
 ```sh
 git clone https://github.com/seirou-iwamoto/agent-memory.git
+mkdir -p ~/.local/bin
 ln -s "$PWD/agent-memory/bin/agent-memory" ~/.local/bin/agent-memory
 ```
 
+`~/.local/bin` has to be on your `PATH` for the last step to be useful; add it in
+your shell's rc file if it isn't already. Any other directory on `PATH` works
+just as well — nothing in the script cares where it is linked from.
+
 Requires `bash` (3.2 is fine — it targets the macOS default), plus `git`,
-[`rg`](https://github.com/BurntSushi/ripgrep) and `jq` on `PATH`.
+[`rg`](https://github.com/BurntSushi/ripgrep) and `jq` on `PATH`. No particular
+Git version is needed: `rev-parse --path-format` is used when available and the
+relative form is absolutised by hand otherwise.
 
 ## Usage
 
@@ -75,6 +82,10 @@ they are mutually exclusive with each other and with `-C`:
   (`$CODEX_HOME/memories/MEMORY.md` and `memory_summary.md`) and Computer
   History summaries.
 
+`--all-sources` works with no Claude memory at all: a machine that only has the
+Codex feed still searches it. `--all-projects` keeps the stricter contract and
+fails when no Claude project memory exists.
+
 The extra sources in `--all-sources` are labelled `"source":"codex"` in the
 output. Treat them as a recent feed rather than durable truth: they are a
 by-product of another agent's session, not a curated corpus.
@@ -91,6 +102,9 @@ One JSON object per line. `search` emits:
 | `line` | line number, or `null` for a filename match |
 | `text` | the matching line (truncated to 400 characters), or the filename |
 | `kind` | `content` or `filename` |
+
+`--limit` takes a plain decimal from 1 to 200 with no leading zeros — `010` is
+rejected rather than quietly read as octal 8.
 
 Exit codes follow `sysexits.h`: `0` success, `1` no matches, `64` usage error,
 `65` malformed data, `66` nothing to read, `69` a missing dependency, `74` I/O
@@ -120,21 +134,33 @@ export AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh
 ```
 
 `AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN` overrides the filename screen the same
-way. Both are validated at startup: an empty value is refused (it would redact
-every line rather than none), and so is anything the engines cannot parse.
+way. Both are validated before a search runs: an empty value is refused (it would
+redact every line rather than none), and so is anything the engines cannot parse.
+`resolve` does not read either pattern and so never validates them.
 
-Each pattern is read by **both** `rg` (Rust regex) and `jq` (Oniguruma), so an
-override has to be valid in both dialects. The startup check tests it against
-each engine and names the one that rejected it.
+The content pattern is read by **both** `rg` (Rust regex) and `jq` (Oniguruma).
+The filename pattern is read by those two **and** by bash's `[[ =~ ]]` (POSIX
+ERE), so it has to be valid in all three — `(?:...)` is accepted by rg and jq but
+not by bash, for instance. Use a plain group instead. The check tests each
+pattern against every engine that will see it and names the one that rejected
+it, because a pattern that fails to evaluate at match time is indistinguishable
+from one that simply did not match.
 
 ## Fail-closed behaviour
 
 The tool stops rather than guessing when the corpus looks wrong:
 
-- a symlinked memory directory is refused (it could point outside the projects root)
-- a memory directory that resolves outside `~/.claude/projects` is refused
-- two different paths that collapse to the same project key are refused as ambiguous
-- paths and queries containing control characters are refused
+- `~/.claude/projects` itself is resolved to a physical path and trusted as the
+  root, but **no component below it may be a symlink** — not the project
+  directory, not `memory`. A symlinked component could point at another project's
+  memory, or outside the root entirely
+- a dangling `memory` symlink is refused rather than skipped, so it cannot quietly
+  drop one project out of a sweep
+- a memory directory that resolves outside the projects root is refused
+- two different paths that collapse to the same project key are refused as
+  ambiguous, and the error names both paths
+- paths and queries containing any C0 control character or DEL are refused. This
+  also keeps escape sequences out of the diagnostics this tool prints
 
 One consequence is worth stating plainly: a single symlinked memory directory
 makes `--all-projects` fail for the whole sweep, not just for that project.
@@ -157,7 +183,7 @@ run when diagnosing it.
 ./tests/run.sh
 ```
 
-91 cases in plain bash, no test framework. Every case runs against a fixture
+125 cases in plain bash, no test framework. Every case runs against a fixture
 under `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, so the suite never reads or writes real
 memory.
 

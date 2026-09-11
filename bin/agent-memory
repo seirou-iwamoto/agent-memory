@@ -87,12 +87,23 @@ validate_sensitive_patterns() {
     jq -n --arg pattern "$pattern_value" '"" | test($pattern)' >/dev/null 2>&1 ||
       die "$EX_USAGE" "$pattern_name is not a valid jq (Oniguruma) pattern"
   done
+
+  # ファイル名の判定だけは bash の [[ =~ ]] (POSIX ERE) でも評価される。rg と jq だけを
+  # 見ていると、両方で有効な PCRE 構文 ((?:...) など) が bash でだけ失敗し、その失敗が
+  # 「非一致」と区別されずに sensitive なファイル名を素通りさせる。3 つ目の方言もここで塞ぐ。
+  { [[ "" =~ $AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN ]]; } 2>/dev/null
+  filename_pattern_status=$?
+  [ "$filename_pattern_status" -le 1 ] ||
+    die "$EX_USAGE" "AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN is not a valid POSIX ERE for bash"
 }
 
+# C0 (0x01-0x1f) と DEL (0x7f) を丸ごと拒否する。以前は CR/LF/TAB だけを見ており、
+# ESC を含むパスが診断メッセージ経由で端末へそのまま流れた (制御シーケンス注入)。
+# NUL は shell 変数に保持できないので、ここへ到達しない。
 reject_control_chars() {
   candidate_value=$1
   case "$candidate_value" in
-    *$'\n'*|*$'\r'*|*$'\t'*)
+    *[[:cntrl:]]*)
       die "$EX_DATAERR" "path or query contains an unsupported control character"
       ;;
   esac
@@ -102,7 +113,9 @@ physical_dir() {
   target_dir=$1
   reject_control_chars "$target_dir"
   [ -d "$target_dir" ] || die "$EX_NOINPUT" "directory not found: $target_dir"
-  (cd "$target_dir" 2>/dev/null && pwd -P) || die "$EX_IOERR" "cannot resolve directory"
+  # CDPATH が設定されていると cd が解決先を stdout に出し、command substitution の
+  # 値が 2 行になる。-- が無いと "-P" のような名前の dir が cd の option に化ける。
+  (CDPATH='' cd -- "$target_dir" >/dev/null 2>&1 && pwd -P) || die "$EX_IOERR" "cannot resolve directory"
 }
 
 add_candidate() {
@@ -124,7 +137,7 @@ add_candidate() {
 
 build_candidates() {
   start_dir=$(physical_dir "$1") || exit $?
-  logical_dir=$(cd "$1" 2>/dev/null && pwd -L) || die "$EX_IOERR" "cannot resolve logical directory"
+  logical_dir=$(CDPATH='' cd -- "$1" >/dev/null 2>&1 && pwd -L) || die "$EX_IOERR" "cannot resolve logical directory"
 
   add_candidate cwd-logical "$logical_dir"
   add_candidate cwd-physical "$start_dir"
@@ -132,9 +145,22 @@ build_candidates() {
   if git -C "$start_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git_root=$(git -C "$start_dir" rev-parse --show-toplevel 2>/dev/null) || die "$EX_IOERR" "cannot resolve Git root"
     add_candidate git-root "$git_root"
-    git_common_dir=$(git -C "$start_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "$EX_IOERR" "cannot resolve Git common directory"
+    # --path-format is a fairly recent rev-parse option. Fall back to the relative
+    # form and absolutise it here rather than making a Git version a hard requirement.
+    git_common_dir=$(git -C "$start_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+      git_common_dir=$(git -C "$start_dir" rev-parse --git-common-dir 2>/dev/null) ||
+      die "$EX_IOERR" "cannot resolve Git common directory"
     case "$git_common_dir" in
-      */.git) add_candidate git-common-root "${git_common_dir%/.git}" ;;
+      /*) ;;
+      *) git_common_dir="$start_dir/$git_common_dir" ;;
+    esac
+    case "$git_common_dir" in
+      */.git)
+        # The relative form can carry ".." segments, which would corrupt the project
+        # key, so normalise through the physical path before deriving a candidate.
+        git_common_root=$(physical_dir "${git_common_dir%/.git}") || exit $?
+        add_candidate git-common-root "$git_common_root"
+        ;;
     esac
   fi
 }
@@ -181,12 +207,26 @@ record_source() {
 add_source() {
   source_relation=$1
   source_path=$2
+  # -L を -d より先に見る。dangling symlink は -d が false になるため、順序を逆にすると
+  # 「symlink は必ず弾く」はずの経路を素通りして、sweep が部分結果を返してしまう。
+  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked memory directory is not accepted: $source_path"
   [ -d "$source_path" ] || return 0
   reject_control_chars "$source_path"
-  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked memory directory is not accepted: $source_path"
 
   physical_source=$(physical_dir "$source_path") || exit $?
   physical_projects_root=$(physical_dir "$AGENT_MEMORY_PROJECTS_DIR") || exit $?
+
+  # projects root 自身は物理化して信頼起点にする ($HOME/.claude が symlink の環境を壊さない)。
+  # その配下は、名目パスの root を物理 root へ置き換えたものと物理パスが一致することを求める。
+  # 一致しなければ途中の成分に symlink がある。以前は最終成分 (memory) しか -L を見ておらず、
+  # projects/<slug> 自体を symlink にすると別 project の memory へ解決できた。
+  nominal_relative=${source_path#"$AGENT_MEMORY_PROJECTS_DIR"/}
+  if [ "$nominal_relative" != "$source_path" ]; then
+    expected_source="$physical_projects_root/$nominal_relative"
+    [ "$physical_source" = "$expected_source" ] ||
+      die "$EX_DATAERR" "symlinked path component under the projects root is not accepted: $source_path"
+  fi
+
   relative_source=${physical_source#"$physical_projects_root"/}
   [ "$relative_source" != "$physical_source" ] || die "$EX_DATAERR" "memory directory escapes Claude projects root: $physical_source"
   case "$relative_source" in
@@ -205,9 +245,9 @@ add_source() {
 add_codex_source() {
   source_relation=$1
   source_path=$2
+  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked Codex memory directory is not accepted: $source_path"
   [ -d "$source_path" ] || return 0
   reject_control_chars "$source_path"
-  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked Codex memory directory is not accepted: $source_path"
 
   physical_source=$(physical_dir "$source_path") || exit $?
   physical_codex_root=$(physical_dir "$AGENT_MEMORY_CODEX_DIR") || exit $?
@@ -231,7 +271,7 @@ resolve_current_sources() {
     relation=${candidate_relations[$candidate_index]}
     slug=$(project_key "$root_path")
     candidate_memory="$AGENT_MEMORY_PROJECTS_DIR/$slug/memory"
-    if [ -d "$candidate_memory" ]; then
+    if [ -d "$candidate_memory" ] || [ -L "$candidate_memory" ]; then
       record_slug "$slug" "$root_path"
       add_source "$relation" "$candidate_memory"
     fi
@@ -249,15 +289,25 @@ resolve_current_sources() {
   [ "${#source_paths[@]}" -gt 0 ] || die "$EX_NOINPUT" "no Claude project memory found for the resolved directory"
 }
 
+# require_claude=1 なら Claude 側が 0 件の時点で止める (--all-projects の従来どおりの契約)。
+# 0 なら空のまま戻る。--all-sources は Codex も足してから合計で判定するため、ここで
+# 止めると「Codex しか無い環境では Codex が検索されない」という隠れた前提になる。
 resolve_all_sources() {
-  [ -d "$AGENT_MEMORY_PROJECTS_DIR" ] || die "$EX_NOINPUT" "Claude projects directory not found"
+  require_claude=${1:-1}
+  if [ ! -d "$AGENT_MEMORY_PROJECTS_DIR" ]; then
+    [ "$require_claude" -eq 0 ] && return 0
+    die "$EX_NOINPUT" "Claude projects directory not found"
+  fi
 
   for memory_dir in "$AGENT_MEMORY_PROJECTS_DIR"/*/memory; do
-    [ -d "$memory_dir" ] || continue
+    # dangling symlink も add_source に渡して停止させる (-d だけだと黙って飛ばされる)。
+    [ -d "$memory_dir" ] || [ -L "$memory_dir" ] || continue
     add_source all-projects "$memory_dir"
   done
 
-  [ "${#source_paths[@]}" -gt 0 ] || die "$EX_NOINPUT" "no Claude project memory directories found"
+  [ "$require_claude" -eq 0 ] ||
+    [ "${#source_paths[@]}" -gt 0 ] ||
+    die "$EX_NOINPUT" "no Claude project memory directories found"
 }
 
 resolve_codex_sources() {
@@ -283,10 +333,16 @@ filename_looks_sensitive() {
   # case 文が併存していたが、境界なしの正規表現と実効挙動が同じで、
   # 環境変数で上書きしても case 文側が残る不整合があったため畳んだ。
   shopt -s nocasematch
-  [[ "$inspected_filename" =~ $AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN ]]
+  { [[ "$inspected_filename" =~ $AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN ]]; } 2>/dev/null
   filename_match_status=$?
   shopt -u nocasematch
-  return "$filename_match_status"
+  # 2 以上は「評価できなかった」であって「一致しなかった」ではない。起動時検証を
+  # すり抜けた場合に備えて、ここでも非一致に倒さず停止する。
+  case "$filename_match_status" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) die "$EX_DATAERR" "sensitive-filename pattern failed to evaluate: $inspected_filename" ;;
+  esac
 }
 
 filename_matches_literal() {
@@ -518,22 +574,25 @@ case "$command_name" in
 
     [ "$#" -eq 1 ] || die "$EX_USAGE" "search requires exactly one literal after --"
     literal_query=$1
+    # 受理する表記を先に固定する。"数字だけ" の判定では [ ] と $(( )) の文法差が残り、
+    # 先頭ゼロが 8 進に化けたり (010 -> 8)、shell の整数範囲を超える値が
+    # 算術比較を素通りして "match があるのに exit 0 で 0 件" になっていた。
     case "$result_limit" in
-      ''|*[!0-9]*) die "$EX_USAGE" "--limit must be an integer from 1 to 200" ;;
+      [1-9]|[1-9][0-9]|1[0-9][0-9]|200) ;;
+      *) die "$EX_USAGE" "--limit must be an integer from 1 to 200" ;;
     esac
-    if [ "$result_limit" -lt 1 ] || [ "$result_limit" -gt 200 ]; then
-      die "$EX_USAGE" "--limit must be an integer from 1 to 200"
-    fi
     [ "$all_projects" -eq 1 ] && [ "$all_sources" -eq 1 ] && die "$EX_USAGE" "--all-projects and --all-sources cannot be combined"
     if [ "$resolve_dir_explicit" -eq 1 ] && { [ "$all_projects" -eq 1 ] || [ "$all_sources" -eq 1 ]; }; then
       die "$EX_USAGE" "-C cannot be combined with --all-projects or --all-sources"
     fi
 
     if [ "$all_sources" -eq 1 ]; then
-      resolve_all_sources
+      resolve_all_sources 0
       resolve_codex_sources
+      [ "${#source_paths[@]}" -gt 0 ] ||
+        die "$EX_NOINPUT" "no Claude project memory or Codex memory found"
     elif [ "$all_projects" -eq 1 ]; then
-      resolve_all_sources
+      resolve_all_sources 1
     else
       allow_project_dir_name=$((1 - resolve_dir_explicit))
       resolve_current_sources "$resolve_dir" "$allow_project_dir_name"
