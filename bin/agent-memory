@@ -22,10 +22,14 @@ AGENT_MEMORY_CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 AGENT_MEMORY_CODEX_DIR="$AGENT_MEMORY_CODEX_HOME/memories"
 # 秘密らしさの判定パターン。既定は岩元の運用に合わせて広く、メールアドレスと
 # 金額まで秘密扱いする。環境変数で上書きできる (空文字は誤って全行 redact する
-# ため拒否する)。rg (Rust regex) と jq (Oniguruma) の両方で解釈されるので、
-# 上書きするなら両方で有効な構文に限る。起動時に validate_sensitive_patterns が検証する。
+# ため拒否する)。content 用は rg (Rust regex) と jq (Oniguruma) の両方が読むので
+# 両方で有効な構文に限る。filename 用は rg だけが読む — 複数エンジンで再解釈すると
+# 構文が通っても意味が割れ、秘匿したい名前が漏れる。検証は search の実行前に
+# validate_sensitive_patterns が行う (resolve はどちらのパターンも読まない)。
 AGENT_MEMORY_SENSITIVE_PATTERN=${AGENT_MEMORY_SENSITIVE_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer[[:space:]]+[^[:space:]]{12,}|(?:api[_-]?key|token|secret|password|authorization|client[_-]?secret|private[_-]?key|cookie|credential)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|(?:[$¥￥][[:space:]]*[0-9][0-9,]*(?:[.][0-9]+)?|[0-9][0-9,]*(?:[.][0-9]+)?[[:space:]]*(?:円|万円|億円|JPY|USD|EUR))'}
 AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN=${AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|credential|client[._-]?secret|private[._-]?key|cookie[._-]?(jar|dump)'}
+
+AGENT_MEMORY_NEWLINE=$'\n'
 
 candidate_paths=()
 candidate_relations=()
@@ -74,6 +78,8 @@ require_commands() {
 # 上書きされたパターンが壊れていると、rg 側は EX_IOERR、jq 側は無言の取りこぼしに
 # なる。redact は最後の防波堤なので、使う前に両エンジンで解釈できることを確かめる。
 validate_sensitive_patterns() {
+  # content パターンは rg (行の抽出) と jq (preview の redact) の両方が読む。
+  # filename パターンは rg だけが読むので、jq 方言の制約は課さない。
   for pattern_name in AGENT_MEMORY_SENSITIVE_PATTERN AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN; do
     pattern_value=${!pattern_name}
     [ -n "$pattern_value" ] ||
@@ -84,17 +90,10 @@ validate_sensitive_patterns() {
     [ "$pattern_rg_status" -le 1 ] ||
       die "$EX_USAGE" "$pattern_name is not a valid ripgrep pattern"
 
+    [ "$pattern_name" = AGENT_MEMORY_SENSITIVE_PATTERN ] || continue
     jq -n --arg pattern "$pattern_value" '"" | test($pattern)' >/dev/null 2>&1 ||
       die "$EX_USAGE" "$pattern_name is not a valid jq (Oniguruma) pattern"
   done
-
-  # ファイル名の判定だけは bash の [[ =~ ]] (POSIX ERE) でも評価される。rg と jq だけを
-  # 見ていると、両方で有効な PCRE 構文 ((?:...) など) が bash でだけ失敗し、その失敗が
-  # 「非一致」と区別されずに sensitive なファイル名を素通りさせる。3 つ目の方言もここで塞ぐ。
-  { [[ "" =~ $AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN ]]; } 2>/dev/null
-  filename_pattern_status=$?
-  [ "$filename_pattern_status" -le 1 ] ||
-    die "$EX_USAGE" "AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN is not a valid POSIX ERE for bash"
 }
 
 # C0 (0x01-0x1f) と DEL (0x7f) を丸ごと拒否する。以前は CR/LF/TAB だけを見ており、
@@ -204,6 +203,18 @@ record_source() {
   source_kinds[source_index]=$source_kind
 }
 
+# projects 配下の project component 自体を検査する。*/memory の glob だけを見ると、
+# memory まで解決できない project symlink (dangling、あるいは target に memory が無い)
+# は glob 結果に現れず、add_source の symlink 検査へ到達しないまま「部分結果を返して
+# exit 0」になる。列挙の段階で止めないと「symlink を許さない」設計を実装し切れない。
+assert_project_component() {
+  project_entry=$1
+  [ -e "$project_entry" ] || [ -L "$project_entry" ] || return 0
+  [ -L "$project_entry" ] &&
+    die "$EX_DATAERR" "symlinked project directory is not accepted: $project_entry"
+  return 0
+}
+
 add_source() {
   source_relation=$1
   source_path=$2
@@ -270,7 +281,9 @@ resolve_current_sources() {
     root_path=${candidate_paths[$candidate_index]}
     relation=${candidate_relations[$candidate_index]}
     slug=$(project_key "$root_path")
-    candidate_memory="$AGENT_MEMORY_PROJECTS_DIR/$slug/memory"
+    candidate_project="$AGENT_MEMORY_PROJECTS_DIR/$slug"
+    assert_project_component "$candidate_project"
+    candidate_memory="$candidate_project/memory"
     if [ -d "$candidate_memory" ] || [ -L "$candidate_memory" ]; then
       record_slug "$slug" "$root_path"
       add_source "$relation" "$candidate_memory"
@@ -283,6 +296,7 @@ resolve_current_sources() {
     case "$CLAUDE_CODE_PROJECT_DIR_NAME" in
       ''|*/*|.|..) die "$EX_DATAERR" "invalid CLAUDE_CODE_PROJECT_DIR_NAME" ;;
     esac
+    assert_project_component "$AGENT_MEMORY_PROJECTS_DIR/$CLAUDE_CODE_PROJECT_DIR_NAME"
     add_source project-dir-name "$AGENT_MEMORY_PROJECTS_DIR/$CLAUDE_CODE_PROJECT_DIR_NAME/memory"
   fi
 
@@ -299,7 +313,11 @@ resolve_all_sources() {
     die "$EX_NOINPUT" "Claude projects directory not found"
   fi
 
-  for memory_dir in "$AGENT_MEMORY_PROJECTS_DIR"/*/memory; do
+  for project_entry in "$AGENT_MEMORY_PROJECTS_DIR"/*; do
+    [ -e "$project_entry" ] || [ -L "$project_entry" ] || continue
+    assert_project_component "$project_entry"
+    [ -d "$project_entry" ] || continue
+    memory_dir="$project_entry/memory"
     # dangling symlink も add_source に渡して停止させる (-d だけだと黙って飛ばされる)。
     [ -d "$memory_dir" ] || [ -L "$memory_dir" ] || continue
     add_source all-projects "$memory_dir"
@@ -327,22 +345,32 @@ value_looks_sensitive() {
   esac
 }
 
+# ファイル名の秘匿判定は rg だけで行う。以前は bash の [[ =~ ]] と jq の test() でも
+# 同じパターンを再解釈していたが、3 つのエンジンは構文が通っても意味が一致しない
+# (bash 3.2 の POSIX ERE に \w は無く、rg と jq では単語文字になる)。片方が一致し
+# 片方が非一致になると「秘匿のはずのファイル名」が出力へ漏れるので、判定を 1 つに畳む。
+#
+# 1 ファイルずつ rg を起動するとプロセス数がファイル数に比例するため、source 単位で
+# 名前をまとめて 1 回だけ流し、その結果を集合として引く。
+collect_sensitive_names() {
+  sensitive_names_blob=""
+  [ "$#" -gt 0 ] || return 0
+
+  sensitive_names_blob=$(printf '%s\n' "$@" | LC_ALL=C rg -i -- "$AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN")
+  collect_status=$?
+  case "$collect_status" in
+    0|1) ;;
+    *) die "$EX_IOERR" "sensitive-filename screening failed" ;;
+  esac
+}
+
 filename_looks_sensitive() {
   inspected_filename=$1
-  # 大小を無視して 1 本の正規表現で判定する。以前はここに credential 等の
-  # case 文が併存していたが、境界なしの正規表現と実効挙動が同じで、
-  # 環境変数で上書きしても case 文側が残る不整合があったため畳んだ。
-  shopt -s nocasematch
-  { [[ "$inspected_filename" =~ $AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN ]]; } 2>/dev/null
-  filename_match_status=$?
-  shopt -u nocasematch
-  # 2 以上は「評価できなかった」であって「一致しなかった」ではない。起動時検証を
-  # すり抜けた場合に備えて、ここでも非一致に倒さず停止する。
-  case "$filename_match_status" in
-    0) return 0 ;;
-    1) return 1 ;;
-    *) die "$EX_DATAERR" "sensitive-filename pattern failed to evaluate: $inspected_filename" ;;
+  [ -n "$sensitive_names_blob" ] || return 1
+  case "$AGENT_MEMORY_NEWLINE$sensitive_names_blob$AGENT_MEMORY_NEWLINE" in
+    *"$AGENT_MEMORY_NEWLINE$inspected_filename$AGENT_MEMORY_NEWLINE"*) return 0 ;;
   esac
+  return 1
 }
 
 filename_matches_literal() {
@@ -412,6 +440,13 @@ search_sources() {
       continue
     fi
 
+    memory_basenames=()
+    for memory_file in "${memory_files[@]}"; do
+      basename_index=${#memory_basenames[@]}
+      memory_basenames[basename_index]=${memory_file##*/}
+    done
+    collect_sensitive_names "${memory_basenames[@]}"
+
     for memory_file in "${memory_files[@]}"; do
       [ "${#result_lines[@]}" -ge "$result_cap" ] && break
       if [ ! -f "$memory_file" ] || [ -L "$memory_file" ]; then
@@ -446,7 +481,7 @@ search_sources() {
           --arg source "$source_kind" \
           --arg relation "$relation" \
           --arg sensitive_pattern "$AGENT_MEMORY_SENSITIVE_PATTERN" \
-          --arg sensitive_filename_pattern "$AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN" '
+          '
           def preview:
             gsub("[\\r\\n]+$"; "")
             | if test($sensitive_pattern; "i")
@@ -454,7 +489,6 @@ search_sources() {
               else .[0:400]
               end;
           select(.type == "match")
-          | select(((.data.path.text | split("/")[-1]) | test($sensitive_filename_pattern; "i")) | not)
           | {
               source: $source,
               relation: $relation,

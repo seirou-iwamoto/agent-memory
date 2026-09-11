@@ -183,7 +183,7 @@ run when diagnosing it.
 ./tests/run.sh
 ```
 
-125 cases in plain bash, no test framework. Every case runs against a fixture
+131 cases in plain bash, no test framework. Every case runs against a fixture
 under `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, so the suite never reads or writes real
 memory.
 
