@@ -10,6 +10,12 @@
 set -u
 umask 077
 
+# ripgrep は RIPGREP_CONFIG_PATH のファイルから引数を読み込む。呼出元がそこに
+# --line-number のような出力を変える option を置いていると、このスクリプトが期待する
+# 出力形式が崩れ、ファイル名の秘匿判定が黙って外れる (実測: credentials.md の中身が
+# 出力に出た)。内部の rg 呼び出しはすべて caller の設定から切り離す。
+unset RIPGREP_CONFIG_PATH
+
 EX_USAGE=64
 EX_DATAERR=65
 EX_NOINPUT=66
@@ -210,6 +216,9 @@ record_source() {
 assert_project_component() {
   project_entry=$1
   [ -e "$project_entry" ] || [ -L "$project_entry" ] || return 0
+  # die がパスを stderr に出すので、その前に制御文字を落とす。この検査を飛ばすと
+  # projects 配下に置かれた名前経由で端末へ制御シーケンスを注入できてしまう。
+  reject_control_chars "$project_entry"
   [ -L "$project_entry" ] &&
     die "$EX_DATAERR" "symlinked project directory is not accepted: $project_entry"
   return 0
@@ -313,6 +322,9 @@ resolve_all_sources() {
     die "$EX_NOINPUT" "Claude projects directory not found"
   fi
 
+  # dot で始まる entry も project たりうる。既定の * は列挙しないため、hidden な
+  # project の memory が検索から漏れ、hidden な symlink は検査もされず通り抜けていた。
+  shopt -s dotglob
   for project_entry in "$AGENT_MEMORY_PROJECTS_DIR"/*; do
     [ -e "$project_entry" ] || [ -L "$project_entry" ] || continue
     assert_project_component "$project_entry"
@@ -322,6 +334,7 @@ resolve_all_sources() {
     [ -d "$memory_dir" ] || [ -L "$memory_dir" ] || continue
     add_source all-projects "$memory_dir"
   done
+  shopt -u dotglob
 
   [ "$require_claude" -eq 0 ] ||
     [ "${#source_paths[@]}" -gt 0 ] ||

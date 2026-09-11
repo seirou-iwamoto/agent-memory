@@ -651,6 +651,53 @@ expect_jq 'the worktree candidate is labelled git-common-root' '.relation' 'git-
 run_am search -C "$tmp_root/wtchild" -- 'parent_repo_marker'
 expect_status 'a worktree searches the parent repository memory' "$EX_OK"
 
+section 'regression: the caller environment cannot bend the screening'
+
+# ripgrep reads arguments from RIPGREP_CONFIG_PATH. A caller with --line-number in
+# theirs reshaped the output the filename screening parses, and a screened file came
+# back in full. The tool unsets that variable now.
+caller_rg_config="$tmp_root/ripgreprc"
+printf '%s\n' '--line-number' > "$caller_rg_config"
+
+RIPGREP_CONFIG_PATH="$caller_rg_config" run_am search -C "$alpha_root" -- 'only_inside_credentials_file'
+expect_status "a caller's ripgrep config cannot expose a screened file" "$EX_NOMATCH"
+expect_stdout_lacks 'no screened path leaks under a caller rg config' 'credentials.md'
+
+RIPGREP_CONFIG_PATH="$caller_rg_config" run_am search -C "$alpha_root" -- 'the quick brown fox'
+expect_status 'an ordinary search still works under a caller rg config' "$EX_OK"
+
+section 'regression: project enumeration is complete and sanitised'
+
+enum_config="$tmp_root/claude-enumeration"
+enum_cwd="$tmp_root/enumeration-cwd"
+mkdir -p "$enum_config/projects/.hidden-project/memory" "$enum_cwd"
+printf '%s\n' '- hidden_project_marker' > "$enum_config/projects/.hidden-project/memory/n.md"
+
+cd "$enum_cwd" || exit 1
+CLAUDE_CONFIG_DIR="$enum_config" run_am search --all-projects -- 'hidden_project_marker'
+cd "$repo_root" || exit 1
+expect_status 'a dot-prefixed project is enumerated' "$EX_OK"
+
+ln -s "$tmp_root/nowhere-at-all" "$enum_config/projects/.hidden-symlink"
+cd "$enum_cwd" || exit 1
+CLAUDE_CONFIG_DIR="$enum_config" run_am search --all-projects -- 'hidden_project_marker'
+cd "$repo_root" || exit 1
+expect_status 'a dot-prefixed project symlink is checked too' "$EX_DATAERR"
+rm "$enum_config/projects/.hidden-symlink"
+
+# The refusal prints the offending path, so it has to be screened for control
+# characters first -- otherwise a crafted entry name injects terminal sequences.
+esc_project_name=$(printf 'bad\033[31m-project')
+ln -s "$tmp_root/nowhere-at-all" "$enum_config/projects/$esc_project_name"
+cd "$enum_cwd" || exit 1
+CLAUDE_CONFIG_DIR="$enum_config" run_am search --all-projects -- 'hidden_project_marker'
+cd "$repo_root" || exit 1
+expect_status 'a control character in a project entry name is refused' "$EX_DATAERR"
+case "$am_stderr" in
+  *$'\033'*) failx 'project enumeration keeps escapes out of stderr' 'stderr carried a raw ESC' ;;
+  *) pass 'project enumeration keeps escapes out of stderr' ;;
+esac
+
 # ---------------------------------------------------------------- read-only guarantee
 
 section 'read-only guarantee'

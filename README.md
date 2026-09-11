@@ -138,13 +138,21 @@ way. Both are validated before a search runs: an empty value is refused (it woul
 redact every line rather than none), and so is anything the engines cannot parse.
 `resolve` does not read either pattern and so never validates them.
 
-The content pattern is read by **both** `rg` (Rust regex) and `jq` (Oniguruma).
-The filename pattern is read by those two **and** by bash's `[[ =~ ]]` (POSIX
-ERE), so it has to be valid in all three — `(?:...)` is accepted by rg and jq but
-not by bash, for instance. Use a plain group instead. The check tests each
-pattern against every engine that will see it and names the one that rejected
-it, because a pattern that fails to evaluate at match time is indistinguishable
-from one that simply did not match.
+The content pattern is read by **both** `rg` (Rust regex) and `jq` (Oniguruma) —
+rg selects the lines, jq redacts the preview — so it has to be valid in both
+dialects. The check tests it against each and names the one that rejected it.
+
+The filename pattern is read by `rg` alone, so only rg's dialect applies to it;
+`(?:...)` and `\w` work there and are accepted. That single-engine rule is
+deliberate. The pattern was once evaluated by three engines, and agreeing on
+syntax is not the same as agreeing on meaning: `\w+` compiles everywhere but
+means nothing to bash 3.2's POSIX ERE, so a name the pattern was meant to hide
+came back in the output. One engine decides, and what rg matches is what gets
+screened.
+
+`RIPGREP_CONFIG_PATH` is unset before any of this runs. A caller's ripgrep
+configuration could otherwise change the output format the screening reads, and
+a single `--line-number` in that file was enough to let a screened file through.
 
 ## Fail-closed behaviour
 
@@ -183,7 +191,7 @@ run when diagnosing it.
 ./tests/run.sh
 ```
 
-131 cases in plain bash, no test framework. Every case runs against a fixture
+138 cases in plain bash, no test framework. Every case runs against a fixture
 under `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, so the suite never reads or writes real
 memory.
 
