@@ -29,7 +29,7 @@ failed_names=()
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/agent-memory-test.XXXXXX") || exit 1
 tmp_root=$(cd "$tmp_root" && pwd -P)
 
-# shellcheck disable=SC2329  # reached through the EXIT trap installed below.
+# shellcheck disable=SC2329,SC2317  # reached through the EXIT trap installed below.
 cleanup() {
   # Only ever remove the directory mktemp handed us, never an expanded surprise.
   case "${tmp_root:-}" in

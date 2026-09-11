@@ -358,7 +358,9 @@ search_sources() {
 
     for memory_file in "${memory_files[@]}"; do
       [ "${#result_lines[@]}" -ge "$result_cap" ] && break
-      [ -f "$memory_file" ] && [ ! -L "$memory_file" ] || continue
+      if [ ! -f "$memory_file" ] || [ -L "$memory_file" ]; then
+        continue
+      fi
       reject_control_chars "$memory_file"
       memory_basename=${memory_file##*/}
       filename_looks_sensitive "$memory_basename" && continue
@@ -519,7 +521,9 @@ case "$command_name" in
     case "$result_limit" in
       ''|*[!0-9]*) die "$EX_USAGE" "--limit must be an integer from 1 to 200" ;;
     esac
-    [ "$result_limit" -ge 1 ] && [ "$result_limit" -le 200 ] || die "$EX_USAGE" "--limit must be an integer from 1 to 200"
+    if [ "$result_limit" -lt 1 ] || [ "$result_limit" -gt 200 ]; then
+      die "$EX_USAGE" "--limit must be an integer from 1 to 200"
+    fi
     [ "$all_projects" -eq 1 ] && [ "$all_sources" -eq 1 ] && die "$EX_USAGE" "--all-projects and --all-sources cannot be combined"
     if [ "$resolve_dir_explicit" -eq 1 ] && { [ "$all_projects" -eq 1 ] || [ "$all_sources" -eq 1 ]; }; then
       die "$EX_USAGE" "-C cannot be combined with --all-projects or --all-sources"

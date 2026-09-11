@@ -31,6 +31,7 @@ jobs:
       - name: Report the interpreter and dependencies under test
         run: |
           /bin/bash --version | head -1
+          shellcheck --version | grep version:
           for dependency in git rg jq; do
             printf '%s: %s\n' "$dependency" "$(command -v "$dependency")"
           done
