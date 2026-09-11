@@ -1,0 +1,527 @@
+#!/bin/bash
+# agent-memory — Claudeのdurable memoryとCodexのrecent feedを両エージェントから読む。
+#
+# WHY: Claude/Codex の生成メモリをコピー同期すると、同じ事実の古い版が並ぶ。
+# Claudeが管理するproject corpusをdurable SSOTとして毎回live解決する。
+# 明示的な--all-sources時だけCodex集約memoryとComputer Historyも低優先feedとして読む。
+# cache / write / sync機能は持たせない。
+# macOS default bash 3.2 互換。
+
+set -u
+umask 077
+
+EX_USAGE=64
+EX_DATAERR=65
+EX_NOINPUT=66
+EX_UNAVAILABLE=69
+EX_IOERR=74
+
+AGENT_MEMORY_CLAUDE_HOME=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
+AGENT_MEMORY_PROJECTS_DIR="$AGENT_MEMORY_CLAUDE_HOME/projects"
+AGENT_MEMORY_CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
+AGENT_MEMORY_CODEX_DIR="$AGENT_MEMORY_CODEX_HOME/memories"
+AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer[[:space:]]+[^[:space:]]{12,}|(?:api[_-]?key|token|secret|password|authorization|client[_-]?secret|private[_-]?key|cookie|credential)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|(?:[$¥￥][[:space:]]*[0-9][0-9,]*(?:[.][0-9]+)?|[0-9][0-9,]*(?:[.][0-9]+)?[[:space:]]*(?:円|万円|億円|JPY|USD|EUR))'
+AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN='AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|(^|[._-])(credential|client[._-]?secret|private[._-]?key|cookie[._-]?(jar|dump))([._-]|$)'
+
+candidate_paths=()
+candidate_relations=()
+source_paths=()
+source_relations=()
+source_kinds=()
+seen_slugs=()
+seen_slug_paths=()
+
+usage() {
+  cat <<'EOF'
+Usage:
+  agent-memory resolve [-C DIR]
+  agent-memory search [-C DIR] [--all-projects|--all-sources] [--limit N] -- LITERAL
+
+Commands:
+  resolve  Resolve live Claude project-memory directories for DIR as JSON Lines.
+  search   Search regular Markdown files in the resolved project memory.
+           Use --all-projects or --all-sources only when wider recall is necessary.
+
+Options:
+  -C DIR          Resolve from DIR instead of the current directory.
+  --all-projects  Search every live Claude project-memory directory.
+  --all-sources   Search every Claude project plus Codex consolidated memory
+                  and Computer History summaries.
+  --limit N       Emit at most N matches (default 40, maximum 200).
+
+LITERAL is always a fixed string. This command is read-only and never caches,
+creates, changes, copies, or synchronizes memory files.
+EOF
+}
+
+die() {
+  exit_code=$1
+  shift
+  printf 'agent-memory: %s\n' "$*" >&2
+  exit "$exit_code"
+}
+
+require_commands() {
+  for required_command in git rg jq; do
+    command -v "$required_command" >/dev/null 2>&1 || die "$EX_UNAVAILABLE" "required command not found: $required_command"
+  done
+}
+
+reject_control_chars() {
+  candidate_value=$1
+  case "$candidate_value" in
+    *$'\n'*|*$'\r'*|*$'\t'*)
+      die "$EX_DATAERR" "path or query contains an unsupported control character"
+      ;;
+  esac
+}
+
+physical_dir() {
+  target_dir=$1
+  reject_control_chars "$target_dir"
+  [ -d "$target_dir" ] || die "$EX_NOINPUT" "directory not found: $target_dir"
+  (cd "$target_dir" 2>/dev/null && pwd -P) || die "$EX_IOERR" "cannot resolve directory"
+}
+
+add_candidate() {
+  candidate_relation=$1
+  candidate_path=$2
+  [ -d "$candidate_path" ] || return 0
+  reject_control_chars "$candidate_path"
+
+  candidate_index=0
+  while [ "$candidate_index" -lt "${#candidate_paths[@]}" ]; do
+    [ "${candidate_paths[$candidate_index]}" = "$candidate_path" ] && return 0
+    candidate_index=$((candidate_index + 1))
+  done
+
+  candidate_index=${#candidate_paths[@]}
+  candidate_paths[candidate_index]=$candidate_path
+  candidate_relations[candidate_index]=$candidate_relation
+}
+
+build_candidates() {
+  start_dir=$(physical_dir "$1") || exit $?
+  logical_dir=$(cd "$1" 2>/dev/null && pwd -L) || die "$EX_IOERR" "cannot resolve logical directory"
+
+  add_candidate cwd-logical "$logical_dir"
+  add_candidate cwd-physical "$start_dir"
+
+  if git -C "$start_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_root=$(git -C "$start_dir" rev-parse --show-toplevel 2>/dev/null) || die "$EX_IOERR" "cannot resolve Git root"
+    add_candidate git-root "$git_root"
+    git_common_dir=$(git -C "$start_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "$EX_IOERR" "cannot resolve Git common directory"
+    case "$git_common_dir" in
+      */.git) add_candidate git-common-root "${git_common_dir%/.git}" ;;
+    esac
+  fi
+}
+
+project_key() {
+  key_path=$1
+  printf '%s' "$key_path" | sed 's/[^A-Za-z0-9]/-/g'
+  printf '\n'
+}
+
+record_slug() {
+  slug_value=$1
+  slug_path=$2
+  slug_index=0
+  while [ "$slug_index" -lt "${#seen_slugs[@]}" ]; do
+    if [ "${seen_slugs[$slug_index]}" = "$slug_value" ]; then
+      [ "${seen_slug_paths[$slug_index]}" = "$slug_path" ] || die "$EX_DATAERR" "project-key collision; refusing ambiguous memory resolution"
+      return 0
+    fi
+    slug_index=$((slug_index + 1))
+  done
+  slug_index=${#seen_slugs[@]}
+  seen_slugs[slug_index]=$slug_value
+  seen_slug_paths[slug_index]=$slug_path
+}
+
+record_source() {
+  source_kind=$1
+  source_relation=$2
+  physical_source=$3
+
+  source_index=0
+  while [ "$source_index" -lt "${#source_paths[@]}" ]; do
+    [ "${source_paths[$source_index]}" = "$physical_source" ] && return 0
+    source_index=$((source_index + 1))
+  done
+
+  source_index=${#source_paths[@]}
+  source_paths[source_index]=$physical_source
+  source_relations[source_index]=$source_relation
+  source_kinds[source_index]=$source_kind
+}
+
+add_source() {
+  source_relation=$1
+  source_path=$2
+  [ -d "$source_path" ] || return 0
+  reject_control_chars "$source_path"
+  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked memory directory is not accepted"
+
+  physical_source=$(physical_dir "$source_path") || exit $?
+  physical_projects_root=$(physical_dir "$AGENT_MEMORY_PROJECTS_DIR") || exit $?
+  relative_source=${physical_source#"$physical_projects_root"/}
+  [ "$relative_source" != "$physical_source" ] || die "$EX_DATAERR" "memory directory escapes Claude projects root"
+  case "$relative_source" in
+    */memory)
+      project_component=${relative_source%/memory}
+      case "$project_component" in
+        ''|*/*) die "$EX_DATAERR" "memory directory is not a direct project child" ;;
+      esac
+      ;;
+    *) die "$EX_DATAERR" "unexpected Claude memory directory layout" ;;
+  esac
+
+  record_source claude "$source_relation" "$physical_source"
+}
+
+add_codex_source() {
+  source_relation=$1
+  source_path=$2
+  [ -d "$source_path" ] || return 0
+  reject_control_chars "$source_path"
+  [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked Codex memory directory is not accepted"
+
+  physical_source=$(physical_dir "$source_path") || exit $?
+  physical_codex_root=$(physical_dir "$AGENT_MEMORY_CODEX_DIR") || exit $?
+  if [ "$physical_source" != "$physical_codex_root" ]; then
+    relative_source=${physical_source#"$physical_codex_root"/}
+    [ "$relative_source" != "$physical_source" ] || die "$EX_DATAERR" "Codex source escapes memory root"
+  fi
+
+  record_source codex "$source_relation" "$physical_source"
+}
+
+resolve_current_sources() {
+  resolve_dir=$1
+  allow_project_dir_name=$2
+
+  build_candidates "$resolve_dir"
+
+  candidate_index=0
+  while [ "$candidate_index" -lt "${#candidate_paths[@]}" ]; do
+    root_path=${candidate_paths[$candidate_index]}
+    relation=${candidate_relations[$candidate_index]}
+    slug=$(project_key "$root_path")
+    candidate_memory="$AGENT_MEMORY_PROJECTS_DIR/$slug/memory"
+    if [ -d "$candidate_memory" ]; then
+      record_slug "$slug" "$root_path"
+      add_source "$relation" "$candidate_memory"
+    fi
+    candidate_index=$((candidate_index + 1))
+  done
+
+  if [ "${#source_paths[@]}" -eq 0 ] && [ "$allow_project_dir_name" -eq 1 ] && [ -n "${CLAUDE_CODE_PROJECT_DIR_NAME:-}" ]; then
+    reject_control_chars "$CLAUDE_CODE_PROJECT_DIR_NAME"
+    case "$CLAUDE_CODE_PROJECT_DIR_NAME" in
+      ''|*/*|.|..) die "$EX_DATAERR" "invalid CLAUDE_CODE_PROJECT_DIR_NAME" ;;
+    esac
+    add_source project-dir-name "$AGENT_MEMORY_PROJECTS_DIR/$CLAUDE_CODE_PROJECT_DIR_NAME/memory"
+  fi
+
+  [ "${#source_paths[@]}" -gt 0 ] || die "$EX_NOINPUT" "no Claude project memory found for the resolved directory"
+}
+
+resolve_all_sources() {
+  [ -d "$AGENT_MEMORY_PROJECTS_DIR" ] || die "$EX_NOINPUT" "Claude projects directory not found"
+
+  for memory_dir in "$AGENT_MEMORY_PROJECTS_DIR"/*/memory; do
+    [ -d "$memory_dir" ] || continue
+    add_source all-projects "$memory_dir"
+  done
+
+  [ "${#source_paths[@]}" -gt 0 ] || die "$EX_NOINPUT" "no Claude project memory directories found"
+}
+
+resolve_codex_sources() {
+  [ -d "$AGENT_MEMORY_CODEX_DIR" ] || return 0
+  add_codex_source codex-consolidated "$AGENT_MEMORY_CODEX_DIR"
+  add_codex_source computer-history "$AGENT_MEMORY_CODEX_DIR/extensions/skysight/resources"
+}
+
+value_looks_sensitive() {
+  inspected_value=$1
+  printf '%s' "$inspected_value" | LC_ALL=C rg -qi -- "$AGENT_MEMORY_SENSITIVE_PATTERN"
+  sensitive_status=${PIPESTATUS[1]}
+  case "$sensitive_status" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) die "$EX_IOERR" "sensitive-value check failed" ;;
+  esac
+}
+
+filename_looks_sensitive() {
+  inspected_filename=$1
+  [[ "$inspected_filename" =~ $AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN ]] && return 0
+
+  shopt -s nocasematch
+  case "$inspected_filename" in
+    *credential*|*client_secret*|*client-secret*|*private_key*|*private-key*|*cookie_jar*|*cookie-jar*|*cookie_dump*|*cookie-dump*)
+      shopt -u nocasematch
+      return 0
+      ;;
+  esac
+  shopt -u nocasematch
+  return 1
+}
+
+filename_matches_literal() {
+  inspected_filename=$1
+  literal_value=$2
+  case "$literal_value" in
+    *[A-Z]*) [[ "$inspected_filename" == *"$literal_value"* ]] ;;
+    *)
+      shopt -s nocasematch
+      [[ "$inspected_filename" == *"$literal_value"* ]]
+      match_status=$?
+      shopt -u nocasematch
+      return "$match_status"
+      ;;
+  esac
+}
+
+emit_resolved_sources() {
+  resolved_lines=()
+
+  source_index=0
+  while [ "$source_index" -lt "${#source_paths[@]}" ]; do
+    resolved_line=$(jq -nc \
+      --arg source "${source_kinds[$source_index]}" \
+      --arg relation "${source_relations[$source_index]}" \
+      --arg dir "${source_paths[$source_index]}" \
+      '{source:$source,relation:$relation,dir:$dir}') || die "$EX_IOERR" "memory-source serialization failed"
+    resolved_lines[source_index]=$resolved_line
+    source_index=$((source_index + 1))
+  done
+
+  source_index=0
+  while [ "$source_index" -lt "${#resolved_lines[@]}" ]; do
+    printf '%s\n' "${resolved_lines[$source_index]}"
+    source_index=$((source_index + 1))
+  done
+}
+
+search_sources() {
+  literal_query=$1
+  result_limit=$2
+
+  reject_control_chars "$literal_query"
+  [ -n "$literal_query" ] || die "$EX_USAGE" "query must not be empty"
+  value_looks_sensitive "$literal_query" && die "$EX_DATAERR" "query resembles a secret; refusing search"
+
+  result_cap=$((result_limit + 1))
+  result_lines=()
+  shopt -s nullglob
+
+  source_index=0
+  while [ "$source_index" -lt "${#source_paths[@]}" ]; do
+    [ "${#result_lines[@]}" -ge "$result_cap" ] && break
+    source_path=${source_paths[$source_index]}
+    relation=${source_relations[$source_index]}
+    source_kind=${source_kinds[$source_index]}
+    if [ "$source_kind" = codex ] && [ "$relation" = codex-consolidated ]; then
+      memory_files=("$source_path/MEMORY.md" "$source_path/memory_summary.md")
+    else
+      memory_files=("$source_path"/*.md)
+    fi
+    searchable_files=()
+
+    if [ "${#memory_files[@]}" -eq 0 ]; then
+      source_index=$((source_index + 1))
+      continue
+    fi
+
+    for memory_file in "${memory_files[@]}"; do
+      [ "${#result_lines[@]}" -ge "$result_cap" ] && break
+      [ -f "$memory_file" ] && [ ! -L "$memory_file" ] || continue
+      reject_control_chars "$memory_file"
+      memory_basename=${memory_file##*/}
+      filename_looks_sensitive "$memory_basename" && continue
+
+      searchable_index=${#searchable_files[@]}
+      searchable_files[searchable_index]=$memory_file
+
+      if filename_matches_literal "$memory_basename" "$literal_query"; then
+        filename_line=$(jq -nc \
+          --arg source "$source_kind" \
+          --arg relation "$relation" \
+          --arg file "$memory_file" \
+          --arg text "$memory_basename" \
+          '{source:$source,relation:$relation,kind:"filename",file:$file,line:null,text:$text}') || die "$EX_IOERR" "filename result serialization failed"
+        result_index=${#result_lines[@]}
+        result_lines[result_index]=$filename_line
+      fi
+    done
+
+    [ "${#result_lines[@]}" -ge "$result_cap" ] && break
+    [ "${#searchable_files[@]}" -gt 0 ] || { source_index=$((source_index + 1)); continue; }
+    remaining_results=$((result_cap - ${#result_lines[@]}))
+
+    content_output=$(
+      rg --json --smart-case --fixed-strings -- "$literal_query" "${searchable_files[@]}" |
+        jq -cr \
+          --arg source "$source_kind" \
+          --arg relation "$relation" \
+          --arg sensitive_pattern "$AGENT_MEMORY_SENSITIVE_PATTERN" \
+          --arg sensitive_filename_pattern "$AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN" '
+          def preview:
+            gsub("[\\r\\n]+$"; "")
+            | if test($sensitive_pattern; "i")
+              then "[REDACTED: potential secret]"
+              else .[0:400]
+              end;
+          select(.type == "match")
+          | select(((.data.path.text | split("/")[-1]) | test($sensitive_filename_pattern; "i")) | not)
+          | {
+              source: $source,
+              relation: $relation,
+              file: .data.path.text,
+              line: .data.line_number,
+              text: (.data.lines.text | preview),
+              kind: "content"
+            }
+      ' |
+        awk -v max="$remaining_results" 'NR <= max { print }'
+      pipeline_status=("${PIPESTATUS[@]}")
+      if [ "${pipeline_status[0]}" -ne 0 ] && [ "${pipeline_status[0]}" -ne 1 ]; then
+        exit "$EX_IOERR"
+      fi
+      [ "${pipeline_status[1]}" -eq 0 ] || exit "$EX_IOERR"
+      [ "${pipeline_status[2]}" -eq 0 ] || exit "$EX_IOERR"
+    )
+    content_status=$?
+    [ "$content_status" -eq 0 ] || die "$EX_IOERR" "memory search failed before completion"
+
+    if [ -n "$content_output" ]; then
+      while IFS= read -r content_line; do
+        result_index=${#result_lines[@]}
+        result_lines[result_index]=$content_line
+      done < <(printf '%s\n' "$content_output")
+    fi
+
+    source_index=$((source_index + 1))
+  done
+
+  shopt -u nullglob
+  result_count=${#result_lines[@]}
+  [ "$result_count" -gt 0 ] || return 1
+
+  result_index=0
+  while [ "$result_index" -lt "$result_count" ] && [ "$result_index" -lt "$result_limit" ]; do
+    printf '%s\n' "${result_lines[$result_index]}"
+    result_index=$((result_index + 1))
+  done
+  if [ "$result_count" -gt "$result_limit" ]; then
+    printf 'agent-memory: output truncated after %s matches; additional results omitted\n' "$result_limit" >&2
+  fi
+}
+
+require_commands
+
+command_name=${1:-}
+[ -n "$command_name" ] || { usage; exit "$EX_USAGE"; }
+shift
+
+case "$command_name" in
+  resolve)
+    resolve_dir=.
+    resolve_dir_explicit=0
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -C)
+          [ "$#" -ge 2 ] || die "$EX_USAGE" "-C requires a directory"
+          resolve_dir=$2
+          resolve_dir_explicit=1
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          die "$EX_USAGE" "unknown resolve option"
+          ;;
+      esac
+    done
+    allow_project_dir_name=$((1 - resolve_dir_explicit))
+    resolve_current_sources "$resolve_dir" "$allow_project_dir_name"
+    emit_resolved_sources
+    ;;
+
+  search)
+    resolve_dir=.
+    resolve_dir_explicit=0
+    all_projects=0
+    all_sources=0
+    result_limit=40
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -C)
+          [ "$#" -ge 2 ] || die "$EX_USAGE" "-C requires a directory"
+          resolve_dir=$2
+          resolve_dir_explicit=1
+          shift 2
+          ;;
+        --all-projects)
+          all_projects=1
+          shift
+          ;;
+        --all-sources)
+          all_sources=1
+          shift
+          ;;
+        --limit)
+          [ "$#" -ge 2 ] || die "$EX_USAGE" "--limit requires a value"
+          result_limit=$2
+          shift 2
+          ;;
+        --)
+          shift
+          break
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          die "$EX_USAGE" "search options must precede -- LITERAL"
+          ;;
+      esac
+    done
+
+    [ "$#" -eq 1 ] || die "$EX_USAGE" "search requires exactly one literal after --"
+    literal_query=$1
+    case "$result_limit" in
+      ''|*[!0-9]*) die "$EX_USAGE" "--limit must be an integer from 1 to 200" ;;
+    esac
+    [ "$result_limit" -ge 1 ] && [ "$result_limit" -le 200 ] || die "$EX_USAGE" "--limit must be an integer from 1 to 200"
+    [ "$all_projects" -eq 1 ] && [ "$all_sources" -eq 1 ] && die "$EX_USAGE" "--all-projects and --all-sources cannot be combined"
+    if [ "$resolve_dir_explicit" -eq 1 ] && { [ "$all_projects" -eq 1 ] || [ "$all_sources" -eq 1 ]; }; then
+      die "$EX_USAGE" "-C cannot be combined with --all-projects or --all-sources"
+    fi
+
+    if [ "$all_sources" -eq 1 ]; then
+      resolve_all_sources
+      resolve_codex_sources
+    elif [ "$all_projects" -eq 1 ]; then
+      resolve_all_sources
+    else
+      allow_project_dir_name=$((1 - resolve_dir_explicit))
+      resolve_current_sources "$resolve_dir" "$allow_project_dir_name"
+    fi
+    search_sources "$literal_query" "$result_limit"
+    ;;
+
+  -h|--help|help)
+    usage
+    ;;
+
+  *)
+    die "$EX_USAGE" "unknown command"
+    ;;
+esac
