@@ -125,14 +125,15 @@ a redacted match are still printed, and anyone who can run this command can also
 logs and scrollback — places where text tends to be copied onward — not to
 protect the files from their owner.
 
-The default pattern is deliberately broad. It treats email addresses and
-currency amounts as sensitive, which means a search for `invoice` may come back
-as a column of redactions. That is the intended trade-off for the author's use;
-if it is wrong for yours, override it from the environment:
+The default pattern covers credential shapes only: cloud and API keys, tokens,
+private keys, bearer headers and `password=`-style assignments. Email addresses
+and amounts of money are left alone; they are ordinary content of a memory, and
+hiding them makes the notes they live in unreadable. To screen more, widen the
+pattern from the environment:
 
 ```sh
-# Narrow redaction down to credential shapes only.
-export AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}'
+# Also redact email addresses and yen amounts.
+export AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|[0-9][0-9,]*(円|万円)'
 ```
 
 `AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN` overrides the filename screen the same

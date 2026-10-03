@@ -26,14 +26,15 @@ AGENT_MEMORY_CLAUDE_HOME=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
 AGENT_MEMORY_PROJECTS_DIR="$AGENT_MEMORY_CLAUDE_HOME/projects"
 AGENT_MEMORY_CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 AGENT_MEMORY_CODEX_DIR="$AGENT_MEMORY_CODEX_HOME/memories"
-# 秘密らしさの判定パターン。既定は広めに取り、メールアドレスと
-# 金額まで秘密扱いする。環境変数で上書きできる (空文字は誤って全行 redact する
-# ため拒否する)。content 用は rg (Rust regex) と jq (Oniguruma) の両方が読むので
-# 両方で有効な構文に限る。filename 用は rg だけが読む — 複数エンジンで再解釈すると
-# 構文が通っても意味が割れ、秘匿したい名前が漏れる。検証は search の実行前に
-# validate_sensitive_patterns が行う (resolve はどちらのパターンも読まない)。
-AGENT_MEMORY_SENSITIVE_PATTERN=${AGENT_MEMORY_SENSITIVE_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer[[:space:]]+[^[:space:]]{12,}|(?:api[_-]?key|token|secret|password|authorization|client[_-]?secret|private[_-]?key|cookie|credential)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|(?:[$¥￥][[:space:]]*[0-9][0-9,]*(?:[.][0-9]+)?|[0-9][0-9,]*(?:[.][0-9]+)?[[:space:]]*(?:円|万円|億円|JPY|USD|EUR))'}
-AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN=${AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}|credential|client[._-]?secret|private[._-]?key|cookie[._-]?(jar|dump)'}
+# 秘密らしさの判定パターン。既定は認証情報の形 (鍵・トークン・秘密鍵・
+# password= 等) だけを対象にし、メールアドレスや金額は通す。環境変数で上書き
+# できる (空文字は誤って全行 redact するため拒否する)。content 用は rg (Rust
+# regex) と jq (Oniguruma) の両方が読むので、両方で有効な構文に限る。filename
+# 用は rg だけが読む — 複数エンジンで再解釈すると構文が通っても意味が割れ、
+# 秘匿したい名前が漏れる。検証は search の実行前に validate_sensitive_patterns
+# が行う (resolve はどちらのパターンも読まない)。
+AGENT_MEMORY_SENSITIVE_PATTERN=${AGENT_MEMORY_SENSITIVE_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer[[:space:]]+[^[:space:]]{12,}|(?:api[_-]?key|token|secret|password|authorization|client[_-]?secret|private[_-]?key|cookie|credential)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}'}
+AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN=${AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|credential|client[._-]?secret|private[._-]?key|cookie[._-]?(jar|dump)'}
 
 AGENT_MEMORY_NEWLINE=$'\n'
 

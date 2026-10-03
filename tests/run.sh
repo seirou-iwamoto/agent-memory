@@ -337,12 +337,12 @@ expect_stdout_has 'a secret-bearing line is redacted' 'REDACTED: potential secre
 expect_stdout_lacks 'the secret value never reaches stdout' 'supersecretvalue123'
 
 run_am search -C "$alpha_root" -- 'example.com'
-expect_status 'an email-bearing line is still searchable' "$EX_OK"
-expect_stdout_has 'an email-bearing line is redacted' 'REDACTED: potential secret'
+expect_status 'an email-bearing line is searchable' "$EX_OK"
+expect_stdout_has 'an email address is not a credential and is shown' 'someone@example.com'
 
-run_am search -C "$alpha_root" -- '300'
-expect_status 'a money-bearing line is still searchable' "$EX_OK"
-expect_stdout_has 'a money-bearing line is redacted' 'REDACTED: potential secret'
+run_am search -C "$alpha_root" -- '300万円'
+expect_status 'a money-shaped query is not refused' "$EX_OK"
+expect_stdout_has 'an amount is not a credential and is shown' '300万円'
 
 run_am search -C "$alpha_root" -- 'only_inside_credentials_file'
 expect_status 'a credentials-named file is excluded from search' "$EX_NOMATCH"
@@ -463,10 +463,10 @@ expect_status '--all-projects excludes the codex feed' "$EX_NOMATCH"
 
 section 'configurable redaction'
 
-AGENT_MEMORY_SENSITIVE_PATTERN='AKIA[0-9A-Z]{16}' run_am search -C "$alpha_root" -- '300'
-expect_status 'a narrowed pattern still searches' "$EX_OK"
-expect_stdout_has 'a narrowed pattern lets the money line through' '300'
-expect_stdout_lacks 'a narrowed pattern stops redacting' 'REDACTED'
+AGENT_MEMORY_SENSITIVE_PATTERN='[0-9][0-9,]*万円' run_am search -C "$alpha_root" -- 'だった'
+expect_status 'a widened pattern still searches' "$EX_OK"
+expect_stdout_has 'a widened pattern redacts the money line' 'REDACTED: potential secret'
+expect_stdout_lacks 'a widened pattern keeps the amount out of stdout' '300万円'
 
 AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN='matches-no-real-filename' \
   run_am search -C "$alpha_root" -- 'only_inside_credentials_file'
