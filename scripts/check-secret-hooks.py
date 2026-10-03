@@ -71,6 +71,10 @@ with tempfile.TemporaryDirectory(prefix='secret-hooks-') as directory:
     run(repo, 'git', 'remote', 'add', 'public', str(public))
     run(repo, 'git', 'push', 'public', f'{tip}:refs/heads/main', expected=1)
     run(repo, 'git', 'push', 'origin', f'{tip}:refs/heads/again')
+    # Same remote name, different push URL: origin's tracking refs describe the fetch side, not the target.
+    run(repo, 'git', 'remote', 'set-url', '--push', 'origin', str(public))
+    run(repo, 'git', 'push', 'origin', f'{tip}:refs/heads/main', expected=1)
+    run(repo, 'git', 'remote', 'set-url', '--delete', '--push', 'origin', str(public))
     run(repo, 'git', '-c', 'core.hooksPath=/dev/null', 'push', '-q', 'origin', f'{base}:refs/heads/main', '--force')
     run(repo, 'git', 'push', 'origin', f'{base}:refs/heads/delete-me')
     run(repo, 'git', 'push', 'origin', ':refs/heads/delete-me')

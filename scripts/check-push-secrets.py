@@ -14,6 +14,7 @@ def git(*args):
 
 
 def revisions(lines, remote=None):
+    """remote: a pushed-to remote whose tracking refs reflect the push target (see tracked_remote)."""
     for line in lines:
         fields = line.split()
         if len(fields) != 4 or any(not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', s) for s in (fields[1], fields[3])):
@@ -44,6 +45,21 @@ def revisions(lines, remote=None):
         yield tip, base
 
 
+def tracked_remote(remote, url):
+    """The remote whose tracking refs may stand in for the push target, or None.
+
+    Tracking refs record what was fetched, from the fetch URL. When the push goes elsewhere (a separate pushurl, a
+    remote renamed to a new repository, a push straight to a URL), they say nothing about what the target holds.
+    """
+    if not remote or not url:
+        return None
+    try:
+        fetch_url = git('remote', 'get-url', remote)
+    except subprocess.CalledProcessError:
+        return None
+    return remote if fetch_url == url else None
+
+
 def scan(command, scanner):
     result = subprocess.run(command, capture_output=True, text=True, timeout=180)
     # Scanner JSON may contain raw credentials. Only emit selected metadata.
@@ -69,12 +85,13 @@ def main():
     parser.add_argument('repository', nargs='?', default='.', help='Repository to scan (CI may use trusted code from another checkout)')
     parser.add_argument('--remote', help='Name of the remote being pushed to (pre-push passes it); its refs may '
                         'stand in for an unknown base. Omitted: only the base given on stdin counts (CI, full scan)')
+    parser.add_argument('--url', help='URL being pushed to (pre-push passes it); required with --remote')
     args = parser.parse_args()
     controls = pathlib.Path(__file__).resolve().parent.parent
     os.chdir(args.repository)
     repo = pathlib.Path(git('rev-parse', '--show-toplevel')).resolve()
     ok = True
-    for tip, base in dict.fromkeys(revisions(sys.stdin, args.remote)):
+    for tip, base in dict.fromkeys(revisions(sys.stdin, tracked_remote(args.remote, args.url))):
         span = f'{base}..{tip}' if base else tip
         print(f'Scanning pushed history: {span}', flush=True)
         ok = scan(['gitleaks', 'git', '--redact=100', '--no-banner', '--report-format=json',
