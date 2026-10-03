@@ -201,6 +201,34 @@ CI runs the suite and `shellcheck` on both Linux and macOS. The macOS leg is the
 one that matters: `/bin/bash` there is 3.2, which is the interpreter this script
 actually targets.
 
+## Secret scanning
+
+The scanners are pinned in `mise.toml` (Gitleaks, TruffleHog, Lefthook). Once
+per clone:
+
+```sh
+mise install
+mise run setup:hooks   # lefthook install
+```
+
+- pre-commit: Gitleaks on the staged changes.
+- pre-push: Gitleaks and TruffleHog on the commits the push adds
+  (`scripts/check-push-secrets.py`). Values are never printed, only file, line
+  and rule.
+- CI (`secret-scan.yml`): the same script on PRs and `main`, run from the base
+  commit's copy so a PR cannot swap the scanner or its allowlist.
+- `mise run scan:secrets` scans the whole history; `mise run test:hooks` checks
+  in a throwaway repository, with a synthetic value, that the hooks really stop
+  a secret.
+
+A false positive goes into `.gitleaksignore` by fingerprint, one at a time. The
+one entry today is the deliberately key-shaped query in the redaction tests.
+
+Both hooks also run `scripts/check-denylist.py` against an optional,
+git-ignored `local.denylist` (one regex per line): words that belong on your
+machine only — names, local paths, private project names — are stopped in added
+lines and commit messages. The list is private by nature, so CI does not run it.
+
 ## License
 
 MIT

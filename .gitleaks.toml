@@ -1,0 +1,5 @@
+title = "agent-memory secret detection"
+# Default rules only. A false positive is listed by fingerprint in .gitleaksignore,
+# one at a time; no path or rule is excluded wholesale.
+[extend]
+useDefault = true

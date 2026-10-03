@@ -1,0 +1,21 @@
+# Secret-scanning tools, pinned. bash/rg/jq stay system-provided: the script
+# targets whatever /bin/bash the host has, so they are not pinned here.
+[tools]
+gitleaks = "8.30.1"
+lefthook = "2.1.14"
+trufflehog = "3.97.9"
+
+[tasks."setup:hooks"]
+description = "Enable this clone's Git hooks (pre-commit: Gitleaks / pre-push: Gitleaks + TruffleHog)"
+run = "lefthook install"
+
+[tasks."scan:secrets"]
+description = "Scan the whole history with Gitleaks + TruffleHog (same script as CI; values are never printed)"
+run = '''
+tip=$(git rev-parse HEAD)
+printf 'local %s local %040d\n' "$tip" 0 | python3 scripts/check-push-secrets.py .
+'''
+
+[tasks."test:hooks"]
+description = "Check in a throwaway repository, with a synthetic value, that the hooks stop a secret"
+run = "python3 scripts/check-secret-hooks.py"

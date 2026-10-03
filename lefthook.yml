@@ -1,0 +1,14 @@
+pre-commit:
+  commands:
+    gitleaks:
+      run: mise exec -- gitleaks git --pre-commit --staged --redact=100 --no-banner --verbose .
+    denylist:
+      run: python3 scripts/check-denylist.py --staged
+
+pre-push:
+  commands:
+    secrets:
+      use_stdin: true
+      run: mise exec -- python3 scripts/check-push-secrets.py --remote {1}
+    denylist:
+      run: python3 scripts/check-denylist.py

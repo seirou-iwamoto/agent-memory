@@ -1,1 +1,3 @@
 .DS_Store
+# Machine-local words that must not be committed (scripts/check-denylist.py).
+local.denylist

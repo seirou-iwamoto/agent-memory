@@ -1,0 +1,3 @@
+# Synthetic AWS-key-shaped query in the redaction tests (sequential letters, never
+# a real key). It must look like a key: the test checks that such a query is refused.
+39a1860c7f27329105698049e068765283c1e6c1:tests/run.sh:aws-access-token:313
