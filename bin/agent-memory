@@ -1,19 +1,21 @@
 #!/bin/bash
-# agent-memory — Claudeのdurable memoryとCodexのrecent feedを両エージェントから読む。
+# agent-memory — read Claude's durable memory and Codex's recent feed from either agent.
 #
-# WHY: Claude/Codex の生成メモリをコピー同期すると、同じ事実の古い版が並ぶ。
-# Claudeが管理するproject corpusをdurable SSOTとして毎回live解決する。
-# 明示的な--all-sources時だけCodex集約memoryとComputer Historyも低優先feedとして読む。
-# cache / write / sync機能は持たせない。
-# macOS default bash 3.2 互換。
+# WHY: copying and syncing the memory Claude and Codex generate leaves old versions
+# of the same fact side by side. The project corpus Claude maintains is the durable
+# source of truth and is resolved live on every call. Only with an explicit
+# --all-sources are Codex's consolidated memory and Computer History read as well,
+# as a lower-priority feed. There is no cache, write or sync feature.
+# Compatible with the macOS default bash 3.2.
 
 set -u
 umask 077
 
-# ripgrep は RIPGREP_CONFIG_PATH のファイルから引数を読み込む。呼出元がそこに
-# --line-number のような出力を変える option を置いていると、このスクリプトが期待する
-# 出力形式が崩れ、ファイル名の秘匿判定が黙って外れる (実測: credentials.md の中身が
-# 出力に出た)。内部の rg 呼び出しはすべて caller の設定から切り離す。
+# ripgrep reads arguments from the file named by RIPGREP_CONFIG_PATH. An option there
+# that changes the output, such as --line-number, breaks the format this script
+# expects, and the filename screening silently stops working (observed: the contents
+# of credentials.md reached the output). Every internal rg call is cut off from the
+# caller's configuration.
 unset RIPGREP_CONFIG_PATH
 
 EX_USAGE=64
@@ -26,13 +28,15 @@ AGENT_MEMORY_CLAUDE_HOME=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
 AGENT_MEMORY_PROJECTS_DIR="$AGENT_MEMORY_CLAUDE_HOME/projects"
 AGENT_MEMORY_CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 AGENT_MEMORY_CODEX_DIR="$AGENT_MEMORY_CODEX_HOME/memories"
-# 秘密らしさの判定パターン。既定は認証情報の形 (鍵・トークン・秘密鍵・
-# password= 等) だけを対象にし、メールアドレスや金額は通す。環境変数で上書き
-# できる (空文字は誤って全行 redact するため拒否する)。content 用は rg (Rust
-# regex) と jq (Oniguruma) の両方が読むので、両方で有効な構文に限る。filename
-# 用は rg だけが読む — 複数エンジンで再解釈すると構文が通っても意味が割れ、
-# 秘匿したい名前が漏れる。検証は search の実行前に validate_sensitive_patterns
-# が行う (resolve はどちらのパターンも読まない)。
+# Patterns for what looks like a secret. The default covers credential shapes only
+# (keys, tokens, private keys, password= and the like); email addresses and amounts
+# of money pass. Both can be overridden from the environment (an empty value is
+# refused, since it would redact every line). The content pattern is read by both
+# rg (Rust regex) and jq (Oniguruma), so it is limited to syntax valid in both. The
+# filename pattern is read by rg alone: re-interpreted by several engines, a pattern
+# can parse everywhere yet mean different things, and a name meant to be hidden
+# leaks. validate_sensitive_patterns checks both before a search runs (resolve reads
+# neither).
 AGENT_MEMORY_SENSITIVE_PATTERN=${AGENT_MEMORY_SENSITIVE_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer[[:space:]]+[^[:space:]]{12,}|(?:api[_-]?key|token|secret|password|authorization|client[_-]?secret|private[_-]?key|cookie|credential)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}'}
 AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN=${AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN-'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|credential|client[._-]?secret|private[._-]?key|cookie[._-]?(jar|dump)'}
 
@@ -82,11 +86,12 @@ require_commands() {
   done
 }
 
-# 上書きされたパターンが壊れていると、rg 側は EX_IOERR、jq 側は無言の取りこぼしに
-# なる。redact は最後の防波堤なので、使う前に両エンジンで解釈できることを確かめる。
+# A broken override makes rg fail with EX_IOERR and jq silently miss matches.
+# Redaction is the last line of defence, so both engines must accept the pattern
+# before it is used.
 validate_sensitive_patterns() {
-  # content パターンは rg (行の抽出) と jq (preview の redact) の両方が読む。
-  # filename パターンは rg だけが読むので、jq 方言の制約は課さない。
+  # The content pattern is read by rg (line selection) and jq (preview redaction).
+  # The filename pattern is read by rg alone, so jq's dialect does not constrain it.
   for pattern_name in AGENT_MEMORY_SENSITIVE_PATTERN AGENT_MEMORY_SENSITIVE_FILENAME_PATTERN; do
     pattern_value=${!pattern_name}
     [ -n "$pattern_value" ] ||
@@ -103,9 +108,10 @@ validate_sensitive_patterns() {
   done
 }
 
-# C0 (0x01-0x1f) と DEL (0x7f) を丸ごと拒否する。以前は CR/LF/TAB だけを見ており、
-# ESC を含むパスが診断メッセージ経由で端末へそのまま流れた (制御シーケンス注入)。
-# NUL は shell 変数に保持できないので、ここへ到達しない。
+# Reject all of C0 (0x01-0x1f) and DEL (0x7f). Only CR/LF/TAB used to be checked,
+# and a path containing ESC reached the terminal through a diagnostic message
+# (control-sequence injection). NUL cannot be held in a shell variable, so it never
+# gets here.
 reject_control_chars() {
   candidate_value=$1
   case "$candidate_value" in
@@ -119,8 +125,9 @@ physical_dir() {
   target_dir=$1
   reject_control_chars "$target_dir"
   [ -d "$target_dir" ] || die "$EX_NOINPUT" "directory not found: $target_dir"
-  # CDPATH が設定されていると cd が解決先を stdout に出し、command substitution の
-  # 値が 2 行になる。-- が無いと "-P" のような名前の dir が cd の option に化ける。
+  # With CDPATH set, cd prints the resolved directory to stdout and the command
+  # substitution yields two lines. Without --, a directory named like "-P" turns
+  # into an option to cd.
   (CDPATH='' cd -- "$target_dir" >/dev/null 2>&1 && pwd -P) || die "$EX_IOERR" "cannot resolve directory"
 }
 
@@ -210,15 +217,17 @@ record_source() {
   source_kinds[source_index]=$source_kind
 }
 
-# projects 配下の project component 自体を検査する。*/memory の glob だけを見ると、
-# memory まで解決できない project symlink (dangling、あるいは target に memory が無い)
-# は glob 結果に現れず、add_source の symlink 検査へ到達しないまま「部分結果を返して
-# exit 0」になる。列挙の段階で止めないと「symlink を許さない」設計を実装し切れない。
+# Inspect each project component under projects itself. A glob of */memory alone
+# never lists a project symlink that does not resolve to a memory directory
+# (dangling, or a target without memory), so it never reaches add_source's symlink
+# check and the result is a partial answer with exit 0. The "no symlinks" design
+# only holds if enumeration stops there.
 assert_project_component() {
   project_entry=$1
   [ -e "$project_entry" ] || [ -L "$project_entry" ] || return 0
-  # die がパスを stderr に出すので、その前に制御文字を落とす。この検査を飛ばすと
-  # projects 配下に置かれた名前経由で端末へ制御シーケンスを注入できてしまう。
+  # die prints the path to stderr, so control characters are rejected first.
+  # Without this check, a name placed under projects could inject control sequences
+  # into the terminal.
   reject_control_chars "$project_entry"
   [ -L "$project_entry" ] &&
     die "$EX_DATAERR" "symlinked project directory is not accepted: $project_entry"
@@ -228,8 +237,9 @@ assert_project_component() {
 add_source() {
   source_relation=$1
   source_path=$2
-  # -L を -d より先に見る。dangling symlink は -d が false になるため、順序を逆にすると
-  # 「symlink は必ず弾く」はずの経路を素通りして、sweep が部分結果を返してしまう。
+  # Test -L before -d. -d is false for a dangling symlink, so the reverse order lets
+  # it slip past the path that must reject every symlink, and the sweep returns a
+  # partial result.
   [ -L "$source_path" ] && die "$EX_DATAERR" "symlinked memory directory is not accepted: $source_path"
   [ -d "$source_path" ] || return 0
   reject_control_chars "$source_path"
@@ -237,10 +247,11 @@ add_source() {
   physical_source=$(physical_dir "$source_path") || exit $?
   physical_projects_root=$(physical_dir "$AGENT_MEMORY_PROJECTS_DIR") || exit $?
 
-  # projects root 自身は物理化して信頼起点にする ($HOME/.claude が symlink の環境を壊さない)。
-  # その配下は、名目パスの root を物理 root へ置き換えたものと物理パスが一致することを求める。
-  # 一致しなければ途中の成分に symlink がある。以前は最終成分 (memory) しか -L を見ておらず、
-  # projects/<slug> 自体を symlink にすると別 project の memory へ解決できた。
+  # The projects root itself is made physical and trusted (a symlinked $HOME/.claude
+  # keeps working). Below it, the physical path must equal the nominal path with its
+  # root swapped for the physical root; otherwise some component on the way is a
+  # symlink. Only the last component (memory) used to be tested with -L, and making
+  # projects/<slug> itself a symlink resolved to another project's memory.
   nominal_relative=${source_path#"$AGENT_MEMORY_PROJECTS_DIR"/}
   if [ "$nominal_relative" != "$source_path" ]; then
     expected_source="$physical_projects_root/$nominal_relative"
@@ -313,9 +324,10 @@ resolve_current_sources() {
   [ "${#source_paths[@]}" -gt 0 ] || die "$EX_NOINPUT" "no Claude project memory found for the resolved directory"
 }
 
-# require_claude=1 なら Claude 側が 0 件の時点で止める (--all-projects の従来どおりの契約)。
-# 0 なら空のまま戻る。--all-sources は Codex も足してから合計で判定するため、ここで
-# 止めると「Codex しか無い環境では Codex が検索されない」という隠れた前提になる。
+# With require_claude=1, stop when no Claude source was found (the --all-projects
+# contract as before). With 0, return empty. --all-sources adds Codex first and
+# judges the total; stopping here would hide the assumption that a machine with only
+# Codex never gets Codex searched.
 resolve_all_sources() {
   require_claude=${1:-1}
   if [ ! -d "$AGENT_MEMORY_PROJECTS_DIR" ]; then
@@ -323,15 +335,16 @@ resolve_all_sources() {
     die "$EX_NOINPUT" "Claude projects directory not found"
   fi
 
-  # dot で始まる entry も project たりうる。既定の * は列挙しないため、hidden な
-  # project の memory が検索から漏れ、hidden な symlink は検査もされず通り抜けていた。
+  # An entry starting with a dot can be a project too. The default * does not list
+  # it, so a hidden project's memory went unsearched and a hidden symlink passed
+  # without being checked.
   shopt -s dotglob
   for project_entry in "$AGENT_MEMORY_PROJECTS_DIR"/*; do
     [ -e "$project_entry" ] || [ -L "$project_entry" ] || continue
     assert_project_component "$project_entry"
     [ -d "$project_entry" ] || continue
     memory_dir="$project_entry/memory"
-    # dangling symlink も add_source に渡して停止させる (-d だけだと黙って飛ばされる)。
+    # Pass dangling symlinks to add_source as well so it stops (-d alone skips them silently).
     [ -d "$memory_dir" ] || [ -L "$memory_dir" ] || continue
     add_source all-projects "$memory_dir"
   done
@@ -359,13 +372,14 @@ value_looks_sensitive() {
   esac
 }
 
-# ファイル名の秘匿判定は rg だけで行う。以前は bash の [[ =~ ]] と jq の test() でも
-# 同じパターンを再解釈していたが、3 つのエンジンは構文が通っても意味が一致しない
-# (bash 3.2 の POSIX ERE に \w は無く、rg と jq では単語文字になる)。片方が一致し
-# 片方が非一致になると「秘匿のはずのファイル名」が出力へ漏れるので、判定を 1 つに畳む。
+# rg alone decides whether a filename is sensitive. bash's [[ =~ ]] and jq's test()
+# used to re-interpret the same pattern, and the three engines can accept the same
+# syntax yet disagree on its meaning (bash 3.2's POSIX ERE has no \w, which rg and
+# jq read as a word character). When one matches and another does not, a filename
+# meant to be hidden reaches the output, so the decision is made in one place.
 #
-# 1 ファイルずつ rg を起動するとプロセス数がファイル数に比例するため、source 単位で
-# 名前をまとめて 1 回だけ流し、その結果を集合として引く。
+# One rg per file would scale processes with the number of files, so each source's
+# names go through rg once and the result is looked up as a set.
 collect_sensitive_names() {
   sensitive_names_blob=""
   [ "$#" -gt 0 ] || return 0
@@ -622,9 +636,10 @@ case "$command_name" in
 
     [ "$#" -eq 1 ] || die "$EX_USAGE" "search requires exactly one literal after --"
     literal_query=$1
-    # 受理する表記を先に固定する。"数字だけ" の判定では [ ] と $(( )) の文法差が残り、
-    # 先頭ゼロが 8 進に化けたり (010 -> 8)、shell の整数範囲を超える値が
-    # 算術比較を素通りして "match があるのに exit 0 で 0 件" になっていた。
+    # Fix the accepted notation first. A "digits only" check left the grammar gap
+    # between [ ] and $(( )): a leading zero turned octal (010 -> 8), and a value
+    # beyond the shell's integer range slipped past the arithmetic comparison,
+    # giving "0 results, exit 0" despite matches.
     case "$result_limit" in
       [1-9]|[1-9][0-9]|1[0-9][0-9]|200) ;;
       *) die "$EX_USAGE" "--limit must be an integer from 1 to 200" ;;

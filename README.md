@@ -222,6 +222,9 @@ mise run setup:hooks   # lefthook install
   in a throwaway repository, with a synthetic value, that the hooks really stop
   a secret.
 
+On GitHub, secret scanning and push protection are enabled as a second net for
+pushes that skip the local hooks, and `main` rejects force pushes and deletion.
+
 A false positive goes into `.gitleaksignore` by fingerprint, one at a time. The
 one entry today is the deliberately key-shaped query in the redaction tests.
 
